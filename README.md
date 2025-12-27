@@ -1,6 +1,9 @@
 # Card Scanner
 
-A high-performance Pokemon card scanning and identification system using YOLO for segmentation and ORB+VLAD for identification.
+>[!WARNING]
+>This project was created using AI tools. The tools were guided by me, but much of the implementation was left to the tools.
+
+A Pokemon card scanning and identification system using YOLO for segmentation and ORB+VLAD for identification.
 
 ## Features
 
@@ -12,7 +15,7 @@ A high-performance Pokemon card scanning and identification system using YOLO fo
 
 ## System Architecture
 
-- **Segmentation**: YOLOv8 handles card detection and perspective correction.
+- **Segmentation**: YOLOv11 handles card detection and perspective correction.
 - **Identification**: ORB features aggregated into VLAD vectors.
 - **Database**: Asynchronous SQLite database stores product metadata and real-time market prices.
 
