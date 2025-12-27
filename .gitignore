@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.DS_Store
+*.log
+
+# Data and Models
+database.db
+test_database.db
+categories/
+vectors/
+scans/
+test_images/
+
+# Temp files
+groups_test.json
+*.pkl
