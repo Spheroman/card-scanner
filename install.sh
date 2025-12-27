@@ -8,7 +8,7 @@ echo "Starting Card Scanner installation..."
 # 1. Update and install system dependencies
 echo "Installing system dependencies..."
 sudo apt-get update
-sudo apt-get install -y python3 python3-venv python3-pip git libgl1-mesa-glx libglib2.0-0
+sudo apt-get install -y python3 python3-venv python3-pip git 
 
 # 2. Setup Virtual Environment
 echo "Setting up virtual environment..."
