@@ -1,4 +1,4 @@
-# Card Scanner 🎴
+# Card Scanner
 
 A high-performance Pokemon card scanning and identification system using YOLO for segmentation and ORB+VLAD for identification.
 
