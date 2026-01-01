@@ -8,6 +8,7 @@ A Pokemon card scanning and identification system using YOLO for segmentation an
 ## Features
 
 - **High Speed Identification**: Uses VLAD (Vector of Locally Aggregated Descriptors) for fast and accurate card matching.
+- **Live Webcam Streaming**: WebSocket API with YOLO object tracking to efficiently track and identify cards in real-time without processing every frame.
 - **Automated Vectors Sync**: Automatically pulls pre-generated vectors and vocabulary from a centralized repository.
 - **Daily Updates**: Background tasks to keep product prices and match vectors up to date.
 - **REST API**: FastAPI-based interface for scanning (`/scan`) and identifying (`/identify`) cards.
@@ -46,6 +47,55 @@ Identify a pre-cropped card image for maximum accuracy.
 
 ```bash
 curl -X POST "http://localhost:8000/identify" -F "image=@cropped_card.jpg"
+```
+
+### Live Webcam Streaming (WebSocket)
+Connect to a WebSocket endpoint for real-time card tracking and identification. Uses YOLO object tracking to efficiently track cards across frames and only runs identification when necessary.
+
+**Endpoint:** `ws://localhost:8000/webcam?top_n=3`
+
+**Protocol:**
+- Client sends base64-encoded JPEG frames
+- Server responds with JSON containing tracked cards and their identifications
+
+**Smart Identification:**
+The tracking system only runs card identification when:
+- A new card is detected (new track_id)
+- A card hasn't been identified yet
+- Sufficient time has passed since last identification (5-second cooldown)
+
+This approach dramatically reduces computational load compared to identifying every frame.
+
+**Example Usage:**
+See `webcam_client_example.html` for a complete browser-based implementation.
+
+**Control Commands:**
+Send JSON to reset the tracker:
+```json
+{"command": "reset"}
+```
+
+**Response Format:**
+```json
+{
+  "tracks": [
+    {
+      "track_id": 1,
+      "box": [x1, y1, x2, y2],
+      "matches": [
+        {
+          "card_id": 12345,
+          "similarity": 0.95,
+          "details": {
+            "name": "Pikachu",
+            "market_price": 12.50,
+            ...
+          }
+        }
+      ]
+    }
+  ]
+}
 ```
 
 ## Configuration

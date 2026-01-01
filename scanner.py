@@ -10,6 +10,72 @@ from ultralytics import YOLO
 import cv2
 import numpy as np
 import vlad_matcher
+import time
+from collections import defaultdict
+
+
+class CardTracker:
+    """
+    Tracks cards across frames and manages their identification state.
+    Only triggers identification when necessary (new track or after cooldown).
+    """
+    def __init__(self, identification_cooldown=5.0):
+        """
+        Args:
+            identification_cooldown: Minimum seconds between re-identifying the same track
+        """
+        self.tracks = {}  # track_id -> {'matches': [...], 'last_identified': timestamp, 'box': [...]}
+        self.identification_cooldown = identification_cooldown
+
+    def should_identify(self, track_id):
+        """
+        Determine if we should run identification for this track.
+        Returns True if:
+        - Track is new (never seen before)
+        - Track hasn't been identified yet
+        - Enough time has passed since last identification
+        """
+        if track_id not in self.tracks:
+            return True
+
+        track = self.tracks[track_id]
+        if 'matches' not in track or not track['matches']:
+            return True
+
+        time_since_last = time.time() - track.get('last_identified', 0)
+        return time_since_last >= self.identification_cooldown
+
+    def update_track(self, track_id, box, matches=None):
+        """
+        Update track information.
+        Args:
+            track_id: The tracking ID from YOLO
+            box: Bounding box coordinates
+            matches: Optional list of match results from identification
+        """
+        if track_id not in self.tracks:
+            self.tracks[track_id] = {}
+
+        self.tracks[track_id]['box'] = box
+
+        if matches is not None:
+            self.tracks[track_id]['matches'] = matches
+            self.tracks[track_id]['last_identified'] = time.time()
+
+    def get_track(self, track_id):
+        """Get track information by ID."""
+        return self.tracks.get(track_id, None)
+
+    def cleanup_old_tracks(self, active_track_ids):
+        """Remove tracks that are no longer active."""
+        inactive_tracks = set(self.tracks.keys()) - set(active_track_ids)
+        for track_id in inactive_tracks:
+            del self.tracks[track_id]
+
+    def reset(self):
+        """Clear all tracked cards."""
+        self.tracks.clear()
+
 
 class Scanner:
     def __init__(self, model_path='models/best(2).pt', vocab_path=None, db_path=None):
@@ -150,6 +216,67 @@ class Scanner:
                         })
         
         return scanned_cards
+
+    def track_and_identify(self, image, tracker, k=1, persist=True):
+        """
+        Track cards across frames and only identify new or updated tracks.
+        Uses YOLO's built-in tracking to avoid re-identifying the same card every frame.
+
+        Args:
+            image: Input frame
+            tracker: CardTracker instance to manage tracking state
+            k: Number of top matches to return for each card
+            persist: Whether to persist tracks across calls
+
+        Returns:
+            List of dictionaries with track_id, box, and matches (if identified)
+        """
+        # Run YOLO with tracking enabled
+        results = self.model.track(image, persist=persist, verbose=False)
+
+        tracked_cards = []
+        active_track_ids = []
+
+        for result in results:
+            if result.boxes and result.boxes.id is not None:
+                for i in range(len(result.boxes)):
+                    box = result.boxes[i]
+                    track_id = int(result.boxes.id[i])
+                    active_track_ids.append(track_id)
+
+                    # Get mask if available
+                    mask = result.masks[i] if result.masks is not None else None
+
+                    # Check if we should identify this track
+                    if tracker.should_identify(track_id):
+                        # Crop and identify
+                        cropped = self.crop(image, box, mask)
+                        matches = self.match(cropped, top_k=k)
+
+                        # Convert to dict format
+                        matches_list = [
+                            {'card_id': m[0], 'similarity': float(m[1])}
+                            for m in matches
+                        ]
+
+                        # Update tracker with new identification
+                        tracker.update_track(track_id, box.xyxy[0].tolist(), matches_list)
+                    else:
+                        # Just update the box position without re-identifying
+                        tracker.update_track(track_id, box.xyxy[0].tolist())
+
+                    # Get current track data
+                    track = tracker.get_track(track_id)
+                    tracked_cards.append({
+                        'track_id': track_id,
+                        'box': track['box'],
+                        'matches': track.get('matches', [])
+                    })
+
+        # Clean up tracks that are no longer detected
+        tracker.cleanup_old_tracks(active_track_ids)
+
+        return tracked_cards
 
 if __name__ == "__main__":
     # Test script for scanner
