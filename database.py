@@ -381,6 +381,15 @@ class Database:
         ) as cursor:
             return await cursor.fetchall()
 
+    @check_connection
+    async def get_groups(self, category_id: int):
+        """Get all groups for a specific category."""
+        async with self.conn.execute(
+            "SELECT group_id, category_id, group_name, last_updated FROM groups WHERE category_id = ?",
+            (category_id,)
+        ) as cursor:
+            return await cursor.fetchall()
+
     def return_columns(self):
         """Return the column names for the products table."""
         return [
@@ -401,6 +410,36 @@ class Database:
             if row and row[0]:
                 return pickle.loads(row[0])
             return None
+
+    @check_connection
+    async def query_prices_batch(self, product_ids: list[int]) -> dict[int, dict]:
+        """
+        Batch query prices for multiple products.
+        Returns a dict mapping product_id to price info.
+        """
+        if not product_ids:
+            return {}
+        
+        placeholders = ','.join('?' * len(product_ids))
+        query = f"""
+            SELECT product_id, low_price, mid_price, high_price, market_price, direct_low_price
+            FROM products
+            WHERE product_id IN ({placeholders})
+        """
+        
+        async with self.conn.execute(query, product_ids) as cursor:
+            rows = await cursor.fetchall()
+        
+        result = {}
+        for row in rows:
+            result[row[0]] = {
+                'low_price': row[1],
+                'mid_price': row[2],
+                'high_price': row[3],
+                'market_price': row[4],
+                'direct_low_price': row[5]
+            }
+        return result
 
 
 # Example usage

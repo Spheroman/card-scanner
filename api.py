@@ -10,6 +10,7 @@ Uses FastAPI to create a REST API.
 
 import fastapi
 from fastapi import UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import database
 import cv2
@@ -53,6 +54,14 @@ async def lifespan(app: fastapi.FastAPI):
         logger.info("Shutdown complete")
 
 app = fastapi.FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 class ScanResult(BaseModel):
     card_id: int
@@ -114,7 +123,7 @@ async def scan(image: UploadFile = fastapi.File(...), top_n: int = 3):
         raise fastapi.HTTPException(status_code=500, detail=str(e))
 
 @app.post("/identify", response_model=List[ScanResult])
-async def identify(image: UploadFile = fastapi.File(...), top_n: int = 3):
+async def identify(image: UploadFile = fastapi.File(...), top_n: int = 4):
     """
     Identify a pre-cropped card image. Skips YOLO detection.
     Args:
@@ -185,6 +194,19 @@ async def price(product_id: int):
     price_cols = ['low_price', 'mid_price', 'high_price', 'market_price', 'direct_low_price']
     return {col: product_dict[col] for col in price_cols}
 
+@app.post("/prices")
+async def prices(product_ids: List[int]):
+    """
+    Get prices for multiple cards in a single request.
+    Args:
+        product_ids: List of product IDs to get prices for
+    Returns:
+        JSON object mapping product IDs to their prices
+    """
+    db = app.state.db
+    result = await db.query_prices_batch(product_ids)
+    return {"prices": result}
+
 @app.get("/categories")
 async def get_categories():
     """
@@ -195,6 +217,19 @@ async def get_categories():
     db = app.state.db
     cats = await db.get_categories()
     return {"categories": [{"category_id": c[0], "category_name": c[1]} for c in cats]}
+
+@app.get("/groups")
+async def get_groups(category_id: int = 3):
+    """
+    Get the groups for a category.
+    Args:
+        category_id: The category ID to get groups for (default: 3 for Pokemon)
+    Returns:
+        JSON object containing the groups in the category
+    """
+    db = app.state.db
+    groups = await db.get_groups(category_id)
+    return {"groups": [{"group_id": g[0], "category_id": g[1], "group_name": g[2]} for g in groups]}
 
 @app.get("/columns")
 async def columns():
