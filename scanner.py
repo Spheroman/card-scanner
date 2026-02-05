@@ -50,8 +50,8 @@ class Scanner:
         If mask is provided, performs perspective transformation.
         """
         if mask is not None:
-            # Extract polygon from mask
-            polygon = mask.xy[0]
+            # Extract polygon from mask and ensure contiguous float32 array for OpenCV
+            polygon = np.ascontiguousarray(mask.xy[0], dtype=np.float32)
             # Approximate the polygon to 4 points
             peri = cv2.arcLength(polygon, True)
             approx = cv2.approxPolyDP(polygon, 0.02 * peri, True)

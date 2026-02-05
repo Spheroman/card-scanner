@@ -1,3 +1,10 @@
+# Production dependencies
+pydantic-settings>=2.0
+slowapi>=0.1.8
+tenacity>=8.0
+prometheus-fastapi-instrumentator>=6.0
+
+# Core dependencies
 aiosqlite==0.22.0
 annotated-doc==0.0.4
 annotated-types==0.7.0

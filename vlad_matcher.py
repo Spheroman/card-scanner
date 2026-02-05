@@ -9,8 +9,21 @@ import os
 import time
 import git
 import asyncio
-from datetime import datetime, time as dt_time
+from datetime import datetime, timedelta
 from pathlib import Path
+
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+    before_sleep_log,
+)
+
+from config import settings
+from logging_config import get_logger
+
+logger = get_logger(__name__)
 
 
 class VLADCardSearch:
@@ -18,11 +31,6 @@ class VLADCardSearch:
     Minimal VLAD card search - load pre-built database and search only.
     No training or database building - just fast inference.
     """
-    
-    REPO_URL = "https://github.com/card-sorter/vectors.git"
-    REPO_PATH = Path("vectors")
-    SYNC_INTERVAL = 86400  # 24 hours in seconds
-    UPDATE_TIME = dt_time(hour=4, minute=0)  # 4 AM daily update
 
     def __init__(self, vocab_path=None, db_path=None):
         """
@@ -34,39 +42,67 @@ class VLADCardSearch:
         self.k = None
         self.database = {}
         self.update_task = None
+        self.repo_path = Path(settings.vectors_repo_path)
 
         # Sync repository and set default paths
         self._sync_repository()
-        
-        self.vocab_path = vocab_path or str(self.REPO_PATH / 'vlad_vocab.npz')
-        self.db_path = db_path or str(self.REPO_PATH / 'vectors')
-        
+
+        self.vocab_path = vocab_path or str(self.repo_path / 'vlad_vocab.npz')
+        self.db_path = db_path or str(self.repo_path / 'vectors')
+
         # Auto-load on initialization
         self.load_vocabulary()
         self.load_database()
     
+    @retry(
+        stop=stop_after_attempt(settings.retry_attempts),
+        wait=wait_exponential(min=settings.retry_min_wait, max=settings.retry_max_wait),
+        retry=retry_if_exception_type((git.GitCommandError, git.InvalidGitRepositoryError)),
+        before_sleep=before_sleep_log(logger, "WARNING"),
+        reraise=True,
+    )
+    def _git_clone(self):
+        """Clone the vectors repository with retry logic."""
+        logger.info(f"Cloning vectors repository from {settings.vectors_repo_url}...")
+        git.Repo.clone_from(
+            settings.vectors_repo_url,
+            self.repo_path,
+            depth=1  # Shallow clone for faster downloads
+        )
+
+    @retry(
+        stop=stop_after_attempt(settings.retry_attempts),
+        wait=wait_exponential(min=settings.retry_min_wait, max=settings.retry_max_wait),
+        retry=retry_if_exception_type((git.GitCommandError,)),
+        before_sleep=before_sleep_log(logger, "WARNING"),
+        reraise=True,
+    )
+    def _git_pull(self):
+        """Pull updates from vectors repository with retry logic."""
+        logger.info("Checking for updates in vectors repository...")
+        repo = git.Repo(self.repo_path)
+        origin = repo.remotes.origin
+        origin.pull()
+
     def _sync_repository(self, force=False):
         """Clone or pull the vectors repository."""
+        sync_interval = 86400  # 24 hours in seconds
         try:
-            if not self.REPO_PATH.exists():
-                print(f"Cloning vectors repository from {self.REPO_URL}...")
-                git.Repo.clone_from(self.REPO_URL, self.REPO_PATH)
+            if not self.repo_path.exists():
+                self._git_clone()
                 self._update_sync_timestamp()
             else:
                 last_sync = self._get_last_sync_timestamp()
-                if force or (time.time() - last_sync > self.SYNC_INTERVAL):
-                    print("Checking for updates in vectors repository...")
-                    repo = git.Repo(self.REPO_PATH)
-                    origin = repo.remotes.origin
-                    origin.pull()
+                if force or (time.time() - last_sync > sync_interval):
+                    self._git_pull()
                     self._update_sync_timestamp()
                 else:
-                    print("Vectors repository is up to date (synced within 24h).")
+                    logger.debug("Vectors repository is up to date (synced within 24h).")
         except Exception as e:
-            print(f"Warning: Failed to sync vectors repository: {e}")
+            logger.warning(f"Failed to sync vectors repository: {e}")
 
     def _get_last_sync_timestamp(self):
-        sync_file = self.REPO_PATH / '.last_sync'
+        sync_file = self.repo_path / '.last_sync'
         if sync_file.exists():
             try:
                 return float(sync_file.read_text())
@@ -75,7 +111,7 @@ class VLADCardSearch:
         return 0
 
     def _update_sync_timestamp(self):
-        sync_file = self.REPO_PATH / '.last_sync'
+        sync_file = self.repo_path / '.last_sync'
         sync_file.write_text(str(time.time()))
 
     def reload_database(self):
@@ -83,7 +119,7 @@ class VLADCardSearch:
         db_path = Path(self.db_path)
         new_database = {}
         if db_path.is_dir():
-            print(f"Reloading split databases from {db_path}...")
+            logger.info(f"Reloading split databases from {db_path}...")
             pkl_files = list(db_path.rglob("*.pkl"))
             total_loaded = 0
             for pkl_file in pkl_files:
@@ -93,37 +129,38 @@ class VLADCardSearch:
                         new_database.update(data)
                         total_loaded += len(data)
                 except Exception as e:
-                    print(f"Warning: Failed to reload {pkl_file}: {e}")
-            print(f"Reloaded {total_loaded} cards from {len(pkl_files)} files")
+                    logger.warning(f"Failed to reload {pkl_file}: {e}")
+            logger.info(f"Reloaded {total_loaded} cards from {len(pkl_files)} files")
         else:
             with open(self.db_path, 'rb') as f:
                 new_database = pickle.load(f)
-            print(f"Reloaded {len(new_database)} cards")
-        
+            logger.info(f"Reloaded {len(new_database)} cards")
+
         self.database = new_database
 
     def sync_and_reload(self):
         """Sync with remote repository and reload database."""
-        print("Starting manual sync and reload...")
+        logger.info("Starting manual sync and reload...")
         self._sync_repository(force=True)
         self.reload_database()
-        print("Sync and reload complete.")
+        logger.info("Sync and reload complete.")
 
     async def scheduled_update(self):
         """Run updates at scheduled time every 24 hours."""
         while True:
             now = datetime.now()
-            target = datetime.combine(now.date(), self.UPDATE_TIME)
-            
+            update_time = settings.vectors_update_time
+            target = datetime.combine(now.date(), update_time)
+
             # If target time has passed today, schedule for tomorrow
-            if now.time() > self.UPDATE_TIME:
-                target = target.replace(day=target.day + 1)
-            
+            if now.time() > update_time:
+                target = target + timedelta(days=1)
+
             sleep_seconds = (target - now).total_seconds()
-            print(f"Matcher background update scheduled in {sleep_seconds/3600:.2f} hours")
-            
+            logger.info(f"Matcher background update scheduled in {sleep_seconds/3600:.2f} hours")
+
             await asyncio.sleep(sleep_seconds)
-            print("Running scheduled matcher update...")
+            logger.info("Running scheduled matcher update...")
             # Run blocking I/O in a thread to keep event loop free
             await asyncio.to_thread(self.sync_and_reload)
 
@@ -131,7 +168,7 @@ class VLADCardSearch:
         """Start the scheduled update background task."""
         if self.update_task is None or self.update_task.done():
             self.update_task = asyncio.create_task(self.scheduled_update())
-            print("Matcher scheduled updates started")
+            logger.info("Matcher scheduled updates started")
 
     def load_vocabulary(self):
         """Load vocabulary from disk."""
@@ -140,13 +177,13 @@ class VLADCardSearch:
         data = np.load(self.vocab_path)
         self.centers = data['centers']
         self.k = int(data['k'])
-        print(f"Vocabulary loaded: K={self.k}")
-    
+        logger.info(f"Vocabulary loaded: K={self.k}")
+
     def load_database(self):
         """Load database from disk (supports single .pkl or directory of .pkl files)."""
         db_path = Path(self.db_path)
         if db_path.is_dir():
-            print(f"Loading split databases from {db_path}...")
+            logger.info(f"Loading split databases from {db_path}...")
             pkl_files = list(db_path.rglob("*.pkl"))
             total_loaded = 0
             for pkl_file in pkl_files:
@@ -156,12 +193,15 @@ class VLADCardSearch:
                         self.database.update(data)
                         total_loaded += len(data)
                 except Exception as e:
-                    print(f"Warning: Failed to load {pkl_file}: {e}")
-            print(f"Total database loaded: {total_loaded} cards from {len(pkl_files)} files")
-        else:
+                    logger.warning(f"Failed to load {pkl_file}: {e}")
+            logger.info(f"Total database loaded: {total_loaded} cards from {len(pkl_files)} files")
+        elif db_path.exists():
             with open(self.db_path, 'rb') as f:
                 self.database = pickle.load(f)
-            print(f"Database loaded: {len(self.database)} cards")
+            logger.info(f"Database loaded: {len(self.database)} cards")
+        else:
+            logger.warning(f"Database not found at {self.db_path}, starting with empty database")
+            self.database = {}
     
     def encode_vlad(self, image):
         """

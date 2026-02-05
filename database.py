@@ -11,18 +11,21 @@ import httpx
 import csv
 import pickle
 import functools
-from datetime import datetime, time as dt_time
+from datetime import datetime, timedelta
 from pathlib import Path
-import logging
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+    before_sleep_log,
+)
 
-DATABASE = "database.db"
-CSV_PATH = "categories/"
-URL = "https://tcgcsv.com/tcgplayer/"
-UPDATE_TIME = dt_time(hour=3, minute=0)  # 3 AM daily update
-MAX_CONCURRENT_DOWNLOADS = 5
+from config import settings
+from logging_config import get_logger
+
+logger = get_logger(__name__)
 
 def check_connection(func):
     """Decorator to ensure database connection is open before method execution."""
@@ -34,13 +37,27 @@ def check_connection(func):
         return await func(self, *args, **kwargs)
     return wrapper
 
+def create_download_retry():
+    """Create a retry decorator for HTTP downloads."""
+    return retry(
+        stop=stop_after_attempt(settings.retry_attempts),
+        wait=wait_exponential(
+            min=settings.retry_min_wait,
+            max=settings.retry_max_wait
+        ),
+        retry=retry_if_exception_type((httpx.HTTPError, httpx.TimeoutException)),
+        before_sleep=before_sleep_log(logger, "WARNING"),
+        reraise=True,
+    )
+
+
 class Database:
     def __init__(self, categories=None):
-        self.categories = categories or [3]
+        self.categories = categories or settings.default_categories
         self.conn = None
         self.update_task = None
-        self.client = httpx.AsyncClient(timeout=30.0)
-        self.semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+        self.client = httpx.AsyncClient(timeout=settings.http_timeout)
+        self.semaphore = asyncio.Semaphore(settings.max_concurrent_downloads)
     
     @property
     def is_initialized(self):
@@ -57,7 +74,7 @@ class Database:
     async def open(self):
         """Open database connection and create tables if needed."""
         try:
-            self.conn = await aiosqlite.connect(DATABASE)
+            self.conn = await aiosqlite.connect(settings.database_path)
             await self._create_tables()
             logger.info("Database connection opened")
         except Exception as e:
@@ -127,41 +144,46 @@ class Database:
     
     def initialize(self):
         """Initialize directory structure for CSV storage."""
-        Path(CSV_PATH).mkdir(parents=True, exist_ok=True)
-        logger.info(f"Initialized directory structure at {CSV_PATH}")
+        Path(settings.csv_path).mkdir(parents=True, exist_ok=True)
+        logger.info(f"Initialized directory structure at {settings.csv_path}")
     
     async def download_csv(self, category_id, group_id):
         """Download CSV file for a specific category and group."""
-        url = f"{URL}{category_id}/{group_id}/ProductsAndPrices.csv"
-        save_path = Path(CSV_PATH) / str(category_id) / str(group_id)
+        url = f"{settings.tcg_csv_url}{category_id}/{group_id}/ProductsAndPrices.csv"
+        save_path = Path(settings.csv_path) / str(category_id) / str(group_id)
         save_path.mkdir(parents=True, exist_ok=True)
-        
+
         file_path = save_path / "ProductsAndPrices.csv"
-        
+
         async with self.semaphore:
             try:
-                response = await self.client.get(url)
-                response.raise_for_status()
-                
+                response = await self._download_with_retry(url)
+
                 with open(file_path, 'wb') as f:
                     f.write(response.content)
-                
+
                 logger.info(f"Downloaded CSV for category {category_id}, group {group_id}")
                 return file_path
             except Exception as e:
                 logger.error(f"Failed to download CSV for {category_id}/{group_id}: {e}")
                 return None
+
+    @create_download_retry()
+    async def _download_with_retry(self, url: str) -> httpx.Response:
+        """Download a URL with retry logic."""
+        response = await self.client.get(url)
+        response.raise_for_status()
+        return response
     
     @check_connection
     async def download_groups(self, category_id):
         """Download and store groups for a specific category."""
-        url = f"{URL}{category_id}/Groups.csv"
+        url = f"{settings.tcg_csv_url}{category_id}/Groups.csv"
         try:
-            response = await self.client.get(url)
-            response.raise_for_status()
-            
+            response = await self._download_with_retry(url)
+
             # Save file locally
-            save_path = Path(CSV_PATH) / str(category_id)
+            save_path = Path(settings.csv_path) / str(category_id)
             save_path.mkdir(parents=True, exist_ok=True)
             file_path = save_path / "Groups.csv"
             with open(file_path, 'wb') as f:
@@ -195,13 +217,12 @@ class Database:
     @check_connection
     async def download_categories(self):
         """Download and store all available categories."""
-        url = f"{URL}Categories.csv"
+        url = f"{settings.tcg_csv_url}Categories.csv"
         try:
-            response = await self.client.get(url)
-            response.raise_for_status()
-            
+            response = await self._download_with_retry(url)
+
             # Save file locally
-            file_path = Path(CSV_PATH) / "Categories.csv"
+            file_path = Path(settings.csv_path) / "Categories.csv"
             with open(file_path, 'wb') as f:
                 f.write(response.content)
             
@@ -320,12 +341,12 @@ class Database:
         """Run updates at scheduled time every 24 hours."""
         while True:
             now = datetime.now()
-            target = datetime.combine(now.date(), UPDATE_TIME)
-            
+            update_time = settings.db_update_time
+            target = datetime.combine(now.date(), update_time)
+
             # If target time has passed today, schedule for tomorrow
-            if now.time() > UPDATE_TIME:
-                target = datetime.combine(now.date(), UPDATE_TIME)
-                target = target.replace(day=target.day + 1)
+            if now.time() > update_time:
+                target = target + timedelta(days=1)
             
             sleep_seconds = (target - now).total_seconds()
             logger.info(f"Next update scheduled in {sleep_seconds/3600:.2f} hours")
@@ -357,10 +378,16 @@ class Database:
         ) as cursor:
             row = await cursor.fetchone()
             if row:
-                # Unpickle the ext_data column (index 15)
+                # Unpickle the ext_data column
+                columns = self.return_columns()
+                ext_data_idx = columns.index('ext_data')
                 row_list = list(row)
-                if row_list[15]:  # ext_data column
-                    row_list[15] = pickle.loads(row_list[15])
+                if row_list[ext_data_idx]:
+                    try:
+                        row_list[ext_data_idx] = pickle.loads(row_list[ext_data_idx])
+                    except Exception as e:
+                        logger.warning(f"Failed to deserialize ext_data for product: {e}")
+                        row_list[ext_data_idx] = {}
                 return tuple(row_list)
             return None
     
@@ -408,7 +435,11 @@ class Database:
         ) as cursor:
             row = await cursor.fetchone()
             if row and row[0]:
-                return pickle.loads(row[0])
+                try:
+                    return pickle.loads(row[0])
+                except Exception as e:
+                    logger.warning(f"Failed to deserialize ext_data for product {product_id}: {e}")
+                    return {}
             return None
 
     @check_connection
@@ -417,8 +448,11 @@ class Database:
         Batch query prices for multiple products.
         Returns a dict mapping product_id to price info.
         """
+        MAX_BATCH_SIZE = 1000
         if not product_ids:
             return {}
+        if len(product_ids) > MAX_BATCH_SIZE:
+            raise ValueError(f"Batch size exceeds maximum of {MAX_BATCH_SIZE}")
         
         placeholders = ','.join('?' * len(product_ids))
         query = f"""

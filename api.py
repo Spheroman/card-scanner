@@ -2,48 +2,294 @@
 Handles the API for the card scanner.
 Uses FastAPI to create a REST API.
 /scan - scans a card from file upload
+/identify - identifies a pre-cropped card
 /price - gets the price of a card
-/columns - gets the columns of the database
-/ext-data - gets the extra data for a category
+/prices - gets prices for multiple cards
+/health - liveness probe
+/ready - readiness probe
 /update - updates the database
 """
 
+import asyncio
+import signal
+import uuid
+import pickle
+from typing import List, Optional
+
 import fastapi
-from fastapi import UploadFile
+from fastapi import UploadFile, Request, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 import uvicorn
-import database
 import cv2
 import numpy as np
-import pickle
-import asyncio
-import os
-from typing import List, Optional
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
-from logging import getLogger
-from scanner import Scanner
+from pathlib import Path
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from prometheus_fastapi_instrumentator import Instrumentator
 
-logger = getLogger(__name__)
+import database
+from scanner import Scanner
+from config import settings
+from logging_config import get_logger, set_correlation_id
+
+logger = get_logger(__name__)
+
+
+# =============================================================================
+# Error Handling
+# =============================================================================
+
+class APIError(Exception):
+    """Custom API error with error tracking ID."""
+
+    def __init__(
+        self,
+        message: str,
+        status_code: int = 500,
+        error_id: Optional[str] = None,
+        internal_message: Optional[str] = None,
+    ):
+        self.message = message
+        self.status_code = status_code
+        self.error_id = error_id or str(uuid.uuid4())[:8]
+        self.internal_message = internal_message or message
+        super().__init__(self.message)
+
+
+async def api_error_handler(request: Request, exc: APIError) -> JSONResponse:
+    """Handle APIError exceptions."""
+    logger.error(
+        f"API Error [{exc.error_id}]: {exc.internal_message}",
+        extra={"error_id": exc.error_id, "status_code": exc.status_code},
+    )
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": exc.message, "error_id": exc.error_id},
+    )
+
+
+async def generic_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Handle unexpected exceptions with sanitized response."""
+    error_id = str(uuid.uuid4())[:8]
+    logger.exception(f"Unhandled exception [{error_id}]: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "An internal error occurred",
+            "error_id": error_id,
+        },
+    )
+
+
+# =============================================================================
+# Rate Limiting
+# =============================================================================
+
+limiter = Limiter(key_func=get_remote_address)
+
+
+# =============================================================================
+# Middleware
+# =============================================================================
+
+class CorrelationIdMiddleware(BaseHTTPMiddleware):
+    """Middleware to extract or generate correlation IDs for request tracing."""
+
+    async def dispatch(self, request: Request, call_next):
+        # Extract or generate correlation ID
+        correlation_id = request.headers.get("X-Correlation-ID")
+        if not correlation_id:
+            correlation_id = str(uuid.uuid4())[:8]
+
+        # Set in context for logging
+        set_correlation_id(correlation_id)
+
+        # Process request
+        response = await call_next(request)
+
+        # Add to response headers
+        response.headers["X-Correlation-ID"] = correlation_id
+
+        return response
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Middleware to add security headers to all responses."""
+
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+
+        # Security headers
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-XSS-Protection"] = "1; mode=block"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+
+        # HSTS for HTTPS deployments
+        if request.url.scheme == "https":
+            response.headers["Strict-Transport-Security"] = (
+                "max-age=31536000; includeSubDomains"
+            )
+
+        return response
+
+
+# =============================================================================
+# Authentication
+# =============================================================================
+
+async def verify_api_key(request: Request) -> Optional[str]:
+    """
+    Verify API key if authentication is enabled.
+    Returns the API key if valid, None if auth is disabled.
+    Raises HTTPException if auth is enabled but key is invalid.
+    """
+    if not settings.auth_enabled:
+        return None
+
+    api_key = request.headers.get("X-API-Key")
+    if not api_key:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing API key. Provide X-API-Key header.",
+        )
+
+    if api_key not in settings.api_keys:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid API key.",
+        )
+
+    return api_key
+
+
+# =============================================================================
+# File Validation
+# =============================================================================
+
+async def validate_file_size(image: UploadFile) -> bytes:
+    """
+    Read and validate uploaded file size.
+    Returns file contents if valid.
+    Raises HTTPException if file is too large.
+    """
+    contents = await image.read()
+
+    if len(contents) > settings.max_file_size:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large. Maximum size is {settings.max_file_size // (1024 * 1024)}MB.",
+        )
+
+    return contents
+
+
+# =============================================================================
+# Application Lifecycle
+# =============================================================================
+
+# Track background tasks for graceful shutdown
+background_tasks: List[asyncio.Task] = []
+shutdown_event: Optional[asyncio.Event] = None
+shutdown_initiated = False
+
+
+async def graceful_shutdown():
+    """Handle graceful shutdown on SIGTERM/SIGINT."""
+    global shutdown_initiated, shutdown_event
+    if shutdown_initiated:
+        return
+    shutdown_initiated = True
+    logger.info("Received shutdown signal, initiating graceful shutdown...")
+    if shutdown_event is not None:
+        shutdown_event.set()
+
+    # Cancel background tasks
+    for task in background_tasks:
+        if not task.done():
+            task.cancel()
+            try:
+                await asyncio.wait_for(task, timeout=5.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+
+    logger.info("Background tasks cancelled")
+
+
+def setup_signal_handlers(loop: asyncio.AbstractEventLoop):
+    """Setup signal handlers for graceful shutdown."""
+    import threading
+
+    # Signal handlers can only be set in the main thread
+    if threading.current_thread() is not threading.main_thread():
+        logger.debug("Skipping signal handler setup (not main thread)")
+        return
+
+    try:
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(
+                sig,
+                lambda: asyncio.create_task(graceful_shutdown()),
+            )
+    except ValueError as e:
+        # This can happen if we're not in the main thread of the main interpreter
+        logger.debug(f"Could not set signal handlers: {e}")
+
 
 @asynccontextmanager
 async def lifespan(app: fastapi.FastAPI):
+    """Application lifespan manager."""
+    global shutdown_event
+
+    # Create shutdown event inside async context (required for Python 3.10+)
+    shutdown_event = asyncio.Event()
+
+    # Setup signal handlers
+    loop = asyncio.get_running_loop()
+    try:
+        setup_signal_handlers(loop)
+    except NotImplementedError:
+        # Signal handlers not supported on Windows
+        logger.warning("Signal handlers not supported on this platform")
+
     # Startup
     scanner = Scanner()
-    db = database.Database(categories=[3])
+    db = database.Database(categories=settings.default_categories)
     db.initialize()
-    
+
+    # Check if database exists before opening (open() creates it)
+    db_exists = Path(settings.database_path).exists()
+
     try:
         await db.open()
-        await db.update()  # Initial update
+
+        # Only run initial update if database didn't exist
+        if not db_exists:
+            logger.info("Database not found, running initial update...")
+            await db.update()
+        else:
+            logger.info("Database exists, skipping initial update (will update on schedule)")
+
+        # Start background tasks and track them
         db.start_scheduled_updates()
         scanner.start_scheduled_updates()
+
+        if db.update_task:
+            background_tasks.append(db.update_task)
+        if scanner.matcher.update_task:
+            background_tasks.append(scanner.matcher.update_task)
+
         app.state.db = db
         app.state.scanner = scanner
-        
+
         logger.info("Application startup complete")
         yield
-        
+
     except Exception as e:
         logger.error(f"Startup failed: {e}")
         raise
@@ -53,15 +299,56 @@ async def lifespan(app: fastapi.FastAPI):
         await db.close()
         logger.info("Shutdown complete")
 
-app = fastapi.FastAPI(lifespan=lifespan)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+# =============================================================================
+# Application Setup
+# =============================================================================
+
+app = fastapi.FastAPI(
+    lifespan=lifespan,
+    title="Card Scanner API",
+    description="Pokemon trading card scanner using YOLOv11 and VLAD matching",
+    version="1.0.0",
 )
+
+# Add exception handlers
+app.add_exception_handler(APIError, api_error_handler)
+app.add_exception_handler(Exception, generic_exception_handler)
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# Add rate limiter state
+app.state.limiter = limiter
+
+# Add middleware (order matters - first added = outermost)
+app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(CorrelationIdMiddleware)
+
+# CORS configuration
+# Fix: allow_credentials must be False when using wildcard origins
+if settings.cors_origins == ["*"]:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,  # Must be False with wildcard
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+# Prometheus metrics
+Instrumentator().instrument(app).expose(app)
+
+
+# =============================================================================
+# Request/Response Models
+# =============================================================================
 
 class ScanResult(BaseModel):
     card_id: int
@@ -69,10 +356,98 @@ class ScanResult(BaseModel):
     box: List[float]
     details: Optional[dict] = None
 
-@app.post("/scan", response_model=List[ScanResult])
-async def scan(image: UploadFile = fastapi.File(...), top_n: int = 3):
+
+class ErrorResponse(BaseModel):
+    error: str
+    error_id: str
+
+
+class HealthResponse(BaseModel):
+    status: str
+
+
+class ReadyResponse(BaseModel):
+    status: str
+    database: str
+    scanner: str
+
+
+# =============================================================================
+# Health Endpoints
+# =============================================================================
+
+@app.get("/health", response_model=HealthResponse, tags=["Health"])
+async def health():
     """
-    Scan an image from file upload. Returns all data for all cards detected in JSON format.
+    Liveness probe - always returns 200 if the service is running.
+    """
+    return {"status": "healthy"}
+
+
+@app.get("/ready", response_model=ReadyResponse, tags=["Health"])
+async def ready():
+    """
+    Readiness probe - checks if the service is ready to accept requests.
+    Verifies database connection and scanner initialization.
+    """
+    db_status = "unknown"
+    scanner_status = "unknown"
+
+    try:
+        db = app.state.db
+        if db and db.is_initialized:
+            # Test database connection
+            async with db.conn.execute("SELECT 1") as cursor:
+                await cursor.fetchone()
+            db_status = "ready"
+        else:
+            db_status = "not_initialized"
+    except Exception as e:
+        logger.warning(f"Readiness check - database error: {e}")
+        db_status = "error"
+
+    try:
+        scanner = app.state.scanner
+        if scanner and scanner.matcher and scanner.matcher.database:
+            scanner_status = "ready"
+        else:
+            scanner_status = "not_initialized"
+    except Exception as e:
+        logger.warning(f"Readiness check - scanner error: {e}")
+        scanner_status = "error"
+
+    if db_status == "ready" and scanner_status == "ready":
+        return {"status": "ready", "database": db_status, "scanner": scanner_status}
+    else:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "not_ready",
+                "database": db_status,
+                "scanner": scanner_status,
+            },
+        )
+
+
+# =============================================================================
+# Scan Endpoints
+# =============================================================================
+
+@app.post(
+    "/scan",
+    response_model=List[ScanResult],
+    responses={401: {"model": ErrorResponse}, 413: {"model": ErrorResponse}},
+    tags=["Scan"],
+)
+@limiter.limit(f"{settings.rate_limit_scan}/minute")
+async def scan(
+    request: Request,
+    image: UploadFile = fastapi.File(...),
+    top_n: int = 3,
+    _api_key: Optional[str] = Depends(verify_api_key),
+):
+    """
+    Scan an image from file upload. Returns all data for all cards detected.
     Args:
         image: The image file to scan
         top_n: The number of top matches to return per card
@@ -80,50 +455,85 @@ async def scan(image: UploadFile = fastapi.File(...), top_n: int = 3):
         JSON object containing all data for all cards detected
     """
     try:
-        # Read the file into memory
-        contents = await image.read()
+        # Validate file size
+        contents = await validate_file_size(image)
+
         nparr = np.frombuffer(contents, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
-        if img is None:
-            raise fastapi.HTTPException(status_code=400, detail="Invalid image file")
 
-        # Use scanner to detect and match cards
-        scanner = app.state.scanner
-        db = app.state.db
-        
-        detected_cards = scanner.scan(img, k=top_n)
+        if img is None:
+            raise APIError("Invalid image file", status_code=400)
+
+        # Use scanner to detect and match cards with timeout
+        scanner = getattr(app.state, 'scanner', None)
+        db = getattr(app.state, 'db', None)
+
+        if not scanner or not db or not db.is_initialized:
+            raise HTTPException(status_code=503, detail="Service not ready")
+
+        try:
+            detected_cards = await asyncio.wait_for(
+                asyncio.to_thread(scanner.scan, img, k=top_n),
+                timeout=settings.yolo_timeout,
+            )
+        except asyncio.TimeoutError:
+            raise APIError(
+                "Scan operation timed out",
+                status_code=504,
+                internal_message=f"YOLO inference exceeded {settings.yolo_timeout}s timeout",
+            )
+
         results = []
-        
         cols = db.return_columns()
-        
+
         for card_segment in detected_cards:
-            box = card_segment['box']
-            for match in card_segment['matches']:
-                product_id = match['card_id']
-                similarity = match['similarity']
-                
+            box = card_segment["box"]
+            for match in card_segment["matches"]:
+                product_id = match["card_id"]
+                similarity = match["similarity"]
+
                 # Query DB for product details
                 product_data = await db.query_by_id(product_id)
                 details = None
                 if product_data:
                     details = dict(zip(cols, product_data))
-                
-                results.append(ScanResult(
-                    card_id=product_id,
-                    similarity=similarity,
-                    box=box,
-                    details=details
-                ))
-            
-        return results
-        
-    except Exception as e:
-        logger.error(f"Scan failed: {e}")
-        raise fastapi.HTTPException(status_code=500, detail=str(e))
 
-@app.post("/identify", response_model=List[ScanResult])
-async def identify(image: UploadFile = fastapi.File(...), top_n: int = 4):
+                results.append(
+                    ScanResult(
+                        card_id=product_id,
+                        similarity=similarity,
+                        box=box,
+                        details=details,
+                    )
+                )
+
+        return results
+
+    except APIError:
+        raise
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise APIError(
+            "Scan failed",
+            status_code=500,
+            internal_message=str(e),
+        )
+
+
+@app.post(
+    "/identify",
+    response_model=List[ScanResult],
+    responses={401: {"model": ErrorResponse}, 413: {"model": ErrorResponse}},
+    tags=["Scan"],
+)
+@limiter.limit(f"{settings.rate_limit_identify}/minute")
+async def identify(
+    request: Request,
+    image: UploadFile = fastapi.File(...),
+    top_n: int = 4,
+    _api_key: Optional[str] = Depends(verify_api_key),
+):
     """
     Identify a pre-cropped card image. Skips YOLO detection.
     Args:
@@ -133,49 +543,83 @@ async def identify(image: UploadFile = fastapi.File(...), top_n: int = 4):
         JSON object containing data for the identified card matches
     """
     try:
-        # Read the file into memory
-        contents = await image.read()
+        # Validate file size
+        contents = await validate_file_size(image)
+
         nparr = np.frombuffer(contents, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
-        if img is None:
-            raise fastapi.HTTPException(status_code=400, detail="Invalid image file")
 
-        scanner = app.state.scanner
-        db = app.state.db
-        
-        # Use identify_card
-        card_result = scanner.identify_card(img, k=top_n)
+        if img is None:
+            raise APIError("Invalid image file", status_code=400)
+
+        scanner = getattr(app.state, 'scanner', None)
+        db = getattr(app.state, 'db', None)
+
+        if not scanner or not db or not db.is_initialized:
+            raise HTTPException(status_code=503, detail="Service not ready")
+
+        # Use identify_card (lighter than full scan) with timeout
+        try:
+            card_result = await asyncio.wait_for(
+                asyncio.to_thread(scanner.identify_card, img, k=top_n),
+                timeout=settings.yolo_timeout,
+            )
+        except asyncio.TimeoutError:
+            raise APIError(
+                "Identification timed out",
+                status_code=504,
+                internal_message=f"Identify operation exceeded {settings.yolo_timeout}s timeout",
+            )
+
         results = []
-        
+
         cols = db.return_columns()
-        box = card_result['box']
-        
-        for match in card_result['matches']:
-            product_id = match['card_id']
-            similarity = match['similarity']
-            
+        box = card_result["box"]
+
+        for match in card_result["matches"]:
+            product_id = match["card_id"]
+            similarity = match["similarity"]
+
             # Query DB for product details
             product_data = await db.query_by_id(product_id)
             details = None
             if product_data:
                 details = dict(zip(cols, product_data))
-            
-            results.append(ScanResult(
-                card_id=product_id,
-                similarity=similarity,
-                box=box,
-                details=details
-            ))
-            
-        return results
-        
-    except Exception as e:
-        logger.error(f"Identification failed: {e}")
-        raise fastapi.HTTPException(status_code=500, detail=str(e))
 
-@app.get("/price")
-async def price(product_id: int):
+            results.append(
+                ScanResult(
+                    card_id=product_id,
+                    similarity=similarity,
+                    box=box,
+                    details=details,
+                )
+            )
+
+        return results
+
+    except APIError:
+        raise
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise APIError(
+            "Identification failed",
+            status_code=500,
+            internal_message=str(e),
+        )
+
+
+# =============================================================================
+# Price Endpoints
+# =============================================================================
+
+@app.get("/price", tags=["Pricing"])
+@limiter.limit(f"{settings.rate_limit_price}/minute")
+async def price(
+    request: Request,
+    product_id: int,
+    _api_key: Optional[str] = Depends(verify_api_key),
+):
     """
     Get the price of a card.
     Args:
@@ -183,19 +627,34 @@ async def price(product_id: int):
     Returns:
         JSON object containing the price of the card
     """
-    db = app.state.db
+    db = getattr(app.state, 'db', None)
+    if not db or not db.is_initialized:
+        raise HTTPException(status_code=503, detail="Service not ready")
+
     product_data = await db.query_by_id(product_id)
     if not product_data:
-        raise fastapi.HTTPException(status_code=404, detail="Product not found")
-    
+        raise HTTPException(status_code=404, detail="Product not found")
+
     cols = db.return_columns()
     product_dict = dict(zip(cols, product_data))
-    
-    price_cols = ['low_price', 'mid_price', 'high_price', 'market_price', 'direct_low_price']
+
+    price_cols = [
+        "low_price",
+        "mid_price",
+        "high_price",
+        "market_price",
+        "direct_low_price",
+    ]
     return {col: product_dict[col] for col in price_cols}
 
-@app.post("/prices")
-async def prices(product_ids: List[int]):
+
+@app.post("/prices", tags=["Pricing"])
+@limiter.limit(f"{settings.rate_limit_price}/minute")
+async def prices(
+    request: Request,
+    product_ids: List[int],
+    _api_key: Optional[str] = Depends(verify_api_key),
+):
     """
     Get prices for multiple cards in a single request.
     Args:
@@ -203,23 +662,44 @@ async def prices(product_ids: List[int]):
     Returns:
         JSON object mapping product IDs to their prices
     """
-    db = app.state.db
+    db = getattr(app.state, 'db', None)
+    if not db or not db.is_initialized:
+        raise HTTPException(status_code=503, detail="Service not ready")
+
     result = await db.query_prices_batch(product_ids)
     return {"prices": result}
 
-@app.get("/categories")
-async def get_categories():
+
+# =============================================================================
+# Data Endpoints
+# =============================================================================
+
+@app.get("/categories", tags=["Data"])
+@limiter.limit(f"{settings.rate_limit_price}/minute")
+async def get_categories(
+    request: Request,
+    _api_key: Optional[str] = Depends(verify_api_key),
+):
     """
     Get the categories in the database.
     Returns:
         JSON object containing the categories in the database
     """
-    db = app.state.db
+    db = getattr(app.state, 'db', None)
+    if not db or not db.is_initialized:
+        raise HTTPException(status_code=503, detail="Service not ready")
+
     cats = await db.get_categories()
     return {"categories": [{"category_id": c[0], "category_name": c[1]} for c in cats]}
 
-@app.get("/groups")
-async def get_groups(category_id: int = 3):
+
+@app.get("/groups", tags=["Data"])
+@limiter.limit(f"{settings.rate_limit_price}/minute")
+async def get_groups(
+    request: Request,
+    category_id: int = 3,
+    _api_key: Optional[str] = Depends(verify_api_key),
+):
     """
     Get the groups for a category.
     Args:
@@ -227,22 +707,43 @@ async def get_groups(category_id: int = 3):
     Returns:
         JSON object containing the groups in the category
     """
-    db = app.state.db
-    groups = await db.get_groups(category_id)
-    return {"groups": [{"group_id": g[0], "category_id": g[1], "group_name": g[2]} for g in groups]}
+    db = getattr(app.state, 'db', None)
+    if not db or not db.is_initialized:
+        raise HTTPException(status_code=503, detail="Service not ready")
 
-@app.get("/columns")
-async def columns():
+    groups = await db.get_groups(category_id)
+    return {
+        "groups": [
+            {"group_id": g[0], "category_id": g[1], "group_name": g[2]} for g in groups
+        ]
+    }
+
+
+@app.get("/columns", tags=["Data"])
+@limiter.limit(f"{settings.rate_limit_price}/minute")
+async def columns(
+    request: Request,
+    _api_key: Optional[str] = Depends(verify_api_key),
+):
     """
     Get the columns in the database.
     Returns:
         JSON object containing the columns in the database
     """
-    db = app.state.db
+    db = getattr(app.state, 'db', None)
+    if not db or not db.is_initialized:
+        raise HTTPException(status_code=503, detail="Service not ready")
+
     return {"columns": db.return_columns()}
 
-@app.get("/ext-data")
-async def ext_data(category_id: int = 3):
+
+@app.get("/ext-data", tags=["Data"])
+@limiter.limit(f"{settings.rate_limit_price}/minute")
+async def ext_data(
+    request: Request,
+    category_id: int = 3,
+    _api_key: Optional[str] = Depends(verify_api_key),
+):
     """
     Get the extended data column names for a category
     Args:
@@ -250,34 +751,69 @@ async def ext_data(category_id: int = 3):
     Returns:
         JSON object containing the extended data column names for the category
     """
-    db = app.state.db
+    db = getattr(app.state, 'db', None)
+    if not db or not db.is_initialized:
+        raise HTTPException(status_code=503, detail="Service not ready")
+
     # Get a sample product from this category to see its ext_data keys
     async with db.conn.execute(
         "SELECT ext_data FROM products WHERE category_id = ? LIMIT 1",
-        (category_id,)
+        (category_id,),
     ) as cursor:
         row = await cursor.fetchone()
         if row and row[0]:
-            ext_dict = pickle.loads(row[0])
-            return {"ext_data_columns": list(ext_dict.keys())}
-    
+            try:
+                ext_dict = pickle.loads(row[0])
+                return {"ext_data_columns": list(ext_dict.keys())}
+            except Exception as e:
+                logger.warning(f"Failed to deserialize ext_data for category {category_id}: {e}")
+                return {"ext_data_columns": []}
+
     return {"ext_data_columns": []}
 
-@app.post("/update")
-async def update():
+
+# =============================================================================
+# Admin Endpoints
+# =============================================================================
+
+@app.post("/update", tags=["Admin"])
+@limiter.limit(f"{settings.rate_limit_update}/minute")
+async def update(
+    request: Request,
+    _api_key: Optional[str] = Depends(verify_api_key),
+):
     """
     Update the database.
     Returns:
         JSON object containing the status of the update
     """
-    db = app.state.db
+    db = getattr(app.state, 'db', None)
+    if not db or not db.is_initialized:
+        raise HTTPException(status_code=503, detail="Service not ready")
+
+    async def safe_update():
+        """Wrapper to handle exceptions in background update task."""
+        try:
+            await db.update()
+        except Exception as e:
+            logger.error(f"Background database update failed: {e}")
+
     try:
         # We trigger update in background to not block the request
-        asyncio.create_task(db.update())
+        task = asyncio.create_task(safe_update())
+        background_tasks.append(task)
         return {"status": "Update started"}
     except Exception as e:
-        logger.error(f"Update trigger failed: {e}")
-        raise fastapi.HTTPException(status_code=500, detail=str(e))
+        raise APIError(
+            "Failed to start update",
+            status_code=500,
+            internal_message=str(e),
+        )
+
+
+# =============================================================================
+# Main
+# =============================================================================
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host=settings.host, port=settings.port)
