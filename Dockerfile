@@ -5,6 +5,10 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 RUN python -m venv .venv
+
+# Install CPU-only PyTorch first (~200MB vs ~2GB for CUDA version)
+RUN .venv/bin/pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
 COPY requirements.txt ./
 RUN .venv/bin/pip install -r requirements.txt
 
@@ -12,7 +16,6 @@ FROM python:3.12.12-slim
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgl1 \
     libglib2.0-0 \
     git \
     && rm -rf /var/lib/apt/lists/*
