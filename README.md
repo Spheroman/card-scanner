@@ -19,7 +19,50 @@ A Pokemon card scanning and identification system using YOLO for segmentation an
 - **Identification**: ORB features aggregated into VLAD vectors.
 - **Database**: Asynchronous SQLite database stores product metadata and real-time market prices.
 
-## Installation (Debian/Ubuntu)
+## Installation
+
+### Docker (Recommended)
+
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/card-sorter/card-scanner.git
+   cd card-scanner
+   ```
+
+2. Build and run:
+   ```bash
+   docker build -t card-scanner .
+   docker run -p 8000:8000 card-scanner
+   ```
+
+The Docker image uses a multi-stage build with CPU-only PyTorch and a slim Python base image to keep the final image small. The container exposes port 8000.
+
+To persist the database and vectors across restarts, mount volumes:
+```bash
+docker run -p 8000:8000 \
+  -v card-scanner-db:/app/database.db \
+  -v card-scanner-vectors:/app/vectors \
+  card-scanner
+```
+
+To pass configuration via environment variables:
+```bash
+docker run -p 8000:8000 \
+  -e CARD_SCANNER_API_KEYS=your-key-here \
+  -e CARD_SCANNER_CORS_ORIGINS=https://yourdomain.com \
+  card-scanner
+```
+
+### Fly.io
+
+A `fly.toml` is included for deploying to [Fly.io](https://fly.io):
+```bash
+fly deploy
+```
+
+The default configuration uses a shared CPU with 2 GB memory in the `sjc` region.
+
+### Debian/Ubuntu (Native)
 
 1. Clone the repository:
    ```bash
