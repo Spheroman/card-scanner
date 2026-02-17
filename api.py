@@ -20,6 +20,7 @@ import fastapi
 from fastapi import UploadFile, Request, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 import uvicorn
 import cv2
@@ -344,6 +345,16 @@ else:
 
 # Prometheus metrics
 Instrumentator().instrument(app).expose(app)
+
+# Serve frontend
+app.mount("/static", StaticFiles(directory="static", html=True), name="static")
+
+
+@app.get("/", include_in_schema=False)
+async def root():
+    """Redirect root to the frontend."""
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="/static/index.html")
 
 
 # =============================================================================
