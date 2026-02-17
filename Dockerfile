@@ -12,11 +12,24 @@ RUN .venv/bin/pip install torch torchvision --index-url https://download.pytorch
 COPY requirements.txt ./
 RUN .venv/bin/pip install -r requirements.txt
 
+# Remove opencv-python (pulled by ultralytics), keep only headless version
+RUN .venv/bin/pip uninstall -y opencv-python opencv-python-headless \
+    && .venv/bin/pip install --no-deps opencv-python-headless==4.12.0.88
+
+# Strip unused torch/ultralytics transitive deps and build artifacts
+RUN .venv/bin/pip uninstall -y scipy matplotlib networkx fontTools polars \
+    && rm -rf \
+    .venv/lib/python3.12/site-packages/torch/test \
+    .venv/lib/python3.12/site-packages/torch/include \
+    .venv/lib/python3.12/site-packages/pip \
+    .venv/lib/python3.12/site-packages/setuptools
+
 FROM python:3.12.12-slim
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-0 \
+    libxcb1 \
     git \
     && rm -rf /var/lib/apt/lists/*
 
