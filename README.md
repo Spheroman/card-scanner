@@ -10,6 +10,7 @@ A Pokemon card scanning and identification system using YOLO for segmentation an
 - **High Speed Identification**: Uses VLAD (Vector of Locally Aggregated Descriptors) for fast and accurate card matching.
 - **Automated Vectors Sync**: Automatically pulls pre-generated vectors and vocabulary from a centralized repository.
 - **Daily Updates**: Background tasks to keep product prices and match vectors up to date.
+- **Web Frontend**: Built-in webcam scanner UI at `/` — capture cards and view results with pricing.
 - **REST API**: FastAPI-based interface for scanning (`/scan`) and identifying (`/identify`) cards.
 - **Production Ready**: Includes Debian installation scripts and systemd service configuration.
 
@@ -74,6 +75,10 @@ The default configuration uses a shared CPU with 2 GB memory in the `sjc` region
    ```bash
    bash install.sh
    ```
+
+## Web Frontend
+
+Navigate to `http://localhost:8000` to use the built-in scanner UI. It provides a live webcam viewfinder — capture a photo to detect and identify cards. Results show the top 3 matches with thumbnails, pricing, and similarity scores. Click any result to see full card details.
 
 ## API Usage
 
