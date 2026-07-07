@@ -32,15 +32,25 @@ class VLADCardSearch:
     No training or database building - just fast inference.
     """
 
-    def __init__(self, vocab_path=None, db_path=None):
+    def __init__(self, vocab_path=None, db_path=None, normalize_size=(400, 557)):
         """
         Initialize searcher with paths to vocabulary and database.
         If paths are not provided, it will use the vectors repository.
+
+        Uses RootSIFT features with a VLAD codebook (default K=256). The
+        encoding here MUST match the database generation script (vlad.py) in
+        the vectors repository so query and database vectors are comparable.
         """
-        self.orb = cv2.ORB_create()
+        self.sift = cv2.SIFT_create()
         self.centers = None
         self.k = None
         self.database = {}
+        # Image normalization size (width, height). Must match the size the
+        # database vectors were generated with (standard card ratio 400x557).
+        self.normalize_size = normalize_size
+        # Cached arrays for fast vectorized search (rebuilt on load/reload).
+        self._db_array = None
+        self._db_ids = None
         self.update_task = None
         self.repo_path = Path(settings.vectors_repo_path)
 
@@ -114,6 +124,17 @@ class VLADCardSearch:
         sync_file = self.repo_path / '.last_sync'
         sync_file.write_text(str(time.time()))
 
+    def _rebuild_search_cache(self):
+        """Rebuild cached arrays (stacked vectors + ids) for fast searching."""
+        if not self.database:
+            self._db_array = None
+            self._db_ids = None
+            return
+        self._db_ids = np.array(list(self.database.keys()))
+        # Store as float16 for memory efficiency; promoted to float32 at search.
+        self._db_array = np.vstack([np.asarray(v) for v in self.database.values()]).astype(np.float16)
+        logger.info(f"Search cache built: {len(self._db_ids)} cards, shape {self._db_array.shape}")
+
     def reload_database(self):
         """Reload database into a new dictionary and swap to prevent race conditions."""
         db_path = Path(self.db_path)
@@ -137,6 +158,7 @@ class VLADCardSearch:
             logger.info(f"Reloaded {len(new_database)} cards")
 
         self.database = new_database
+        self._rebuild_search_cache()
 
     def sync_and_reload(self):
         """Sync with remote repository and reload database."""
@@ -174,10 +196,26 @@ class VLADCardSearch:
         """Load vocabulary from disk."""
         if not os.path.exists(self.vocab_path):
             raise FileNotFoundError(f"Vocabulary not found at {self.vocab_path}")
-        data = np.load(self.vocab_path)
-        self.centers = data['centers']
+        data = np.load(self.vocab_path, allow_pickle=True)
+        self.centers = data['centers'].astype(np.float32)
         self.k = int(data['k'])
-        logger.info(f"Vocabulary loaded: K={self.k}")
+
+        # Use the normalize_size the vocabulary was trained with, if present,
+        # so encoding matches database generation exactly.
+        if 'normalize_size' in data:
+            saved_size = data['normalize_size']
+            if saved_size is None or (isinstance(saved_size, np.ndarray) and saved_size.shape == ()):
+                saved_size = None
+            else:
+                saved_size = tuple(int(x) for x in saved_size)
+            if saved_size != self.normalize_size:
+                logger.warning(
+                    f"Vocabulary trained with normalize_size={saved_size}, "
+                    f"overriding current setting {self.normalize_size}"
+                )
+                self.normalize_size = saved_size
+
+        logger.info(f"Vocabulary loaded: K={self.k}, dim={self.centers.shape[1]}, normalize={self.normalize_size}")
 
     def load_database(self):
         """Load database from disk (supports single .pkl or directory of .pkl files)."""
@@ -202,16 +240,24 @@ class VLADCardSearch:
         else:
             logger.warning(f"Database not found at {self.db_path}, starting with empty database")
             self.database = {}
+
+        self._rebuild_search_cache()
     
-    def encode_vlad(self, image):
+    def encode_vlad(self, image, max_features=None):
         """
-        Encode an image to VLAD vector.
-        
+        Encode an image to a VLAD vector using RootSIFT features.
+
+        This must match the database generation algorithm (vlad.py) exactly:
+        grayscale -> resize to normalize_size -> SIFT -> RootSIFT (L1 + sqrt)
+        -> VLAD aggregation -> power norm -> L2 norm -> float16.
+
         Args:
             image: cv2 image (numpy array, BGR or Grayscale)
-            
+            max_features: Optional cap on SIFT features (keeps strongest);
+                          None uses all features (best accuracy).
+
         Returns:
-            VLAD vector (normalized)
+            VLAD vector (normalized, float16)
         """
         if image is None:
             raise ValueError("Invalid image provided")
@@ -221,34 +267,49 @@ class VLADCardSearch:
             img = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         else:
             img = image
-        
-        # Extract ORB descriptors
-        _, des = self.orb.detectAndCompute(img, None)
-        
+
+        # Normalize image size to match database generation
+        if self.normalize_size is not None:
+            img = cv2.resize(img, self.normalize_size, interpolation=cv2.INTER_AREA)
+
+        # Extract SIFT descriptors
+        kp, des = self.sift.detectAndCompute(img, None)
+
         if des is None:
             # Return zero vector if no features
-            return np.zeros(self.centers.shape[0] * self.centers.shape[1], dtype=np.float32)
-        
+            return np.zeros(self.centers.shape[0] * self.centers.shape[1], dtype=np.float16)
+
+        # Optionally keep only the strongest features (for real-time speed)
+        if max_features and len(des) > max_features:
+            responses = np.array([k.response for k in kp])
+            top_indices = np.argsort(responses)[-max_features:]
+            des = des[top_indices]
+
+        # RootSIFT normalization: L1 normalize then element-wise sqrt
         des = des.astype(np.float32)
+        des /= (np.linalg.norm(des, ord=1, axis=1, keepdims=True) + 1e-7)
+        np.sqrt(des, out=des)
+
         K, D = self.centers.shape
         vlad_vector = np.zeros((K, D), dtype=np.float32)
-        
-        # Assign descriptors to nearest centers and aggregate residuals
-        for descriptor in des:
-            distances = np.linalg.norm(self.centers - descriptor, axis=1)
-            nearest_idx = np.argmin(distances)
-            residual = descriptor - self.centers[nearest_idx]
-            vlad_vector[nearest_idx] += residual
-        
+
+        # Vectorized nearest-center assignment and residual aggregation
+        distances = np.sqrt(np.sum((des[:, None, :] - self.centers[None, :, :]) ** 2, axis=2))
+        assignments = np.argmin(distances, axis=1)
+        for k in range(K):
+            mask = (assignments == k)
+            if np.any(mask):
+                vlad_vector[k] = np.sum(des[mask] - self.centers[k], axis=0)
+
         # Flatten and normalize
         vlad_flat = vlad_vector.flatten()
         vlad_flat = np.sign(vlad_flat) * np.sqrt(np.abs(vlad_flat))  # Power norm
-        
+
         norm = np.linalg.norm(vlad_flat)
         if norm > 0:
             vlad_flat = vlad_flat / norm  # L2 norm
-        
-        return vlad_flat
+
+        return vlad_flat.astype(np.float16)
     
     def search(self, query_image, top_k=5):
         """
@@ -261,17 +322,31 @@ class VLADCardSearch:
         Returns:
             List of (card_id, similarity_score) tuples, sorted by similarity
         """
+        if not self.database:
+            return []
+
+        # Ensure the search cache is built
+        if self._db_array is None:
+            self._rebuild_search_cache()
+            if self._db_array is None:
+                return []
+
         # Encode query
         query_vlad = self.encode_vlad(query_image)
-        
-        # Compute similarities
-        similarities = {}
-        for card_id, db_vlad in self.database.items():
-            similarity = np.dot(query_vlad, db_vlad)
-            similarities[card_id] = similarity
-        
-        # Sort and return top-k
-        results = sorted(similarities.items(), key=lambda x: x[1], reverse=True)[:top_k]
+
+        # Cosine similarity via dot product (vectors are L2-normalized).
+        # Promote to float32 to avoid float16 precision/overflow issues.
+        similarities = np.dot(self._db_array.astype(np.float32), query_vlad.astype(np.float32))
+
+        # Select top-k
+        top_k = min(top_k, len(similarities))
+        if top_k < 50:
+            top_indices = np.argsort(similarities)[-top_k:][::-1]
+        else:
+            top_indices = np.argpartition(similarities, -top_k)[-top_k:]
+            top_indices = top_indices[np.argsort(similarities[top_indices])[::-1]]
+
+        results = [(str(self._db_ids[i]), float(similarities[i])) for i in top_indices]
         return results
     
     def compare_images(self, image1, image2):
@@ -285,8 +360,8 @@ class VLADCardSearch:
         Returns:
             Similarity score (0-1, higher is more similar)
         """
-        vlad1 = self.encode_vlad(image1)
-        vlad2 = self.encode_vlad(image2)
+        vlad1 = self.encode_vlad(image1).astype(np.float32)
+        vlad2 = self.encode_vlad(image2).astype(np.float32)
         similarity = np.dot(vlad1, vlad2)
         return float(similarity)
     
@@ -311,8 +386,8 @@ class VLADCardSearch:
 if __name__ == "__main__":
     # Initialize (auto-loads vocab and database)
     searcher = VLADCardSearch(
-        vocab_path='models/pokemon_vocab.npz',
-        db_path='pokemon_database.pkl'
+        vocab_path='vlad_vocab.npz',
+        db_path='vectors'
     )
     
     # Search for similar cards
