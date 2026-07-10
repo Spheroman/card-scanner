@@ -95,15 +95,27 @@ class Scanner:
         cropped = image[y1:y2, x1:x2]
         return cropped
 
-    def match(self, cropped_image, top_k=1):
+    def match(self, cropped_image, top_k=1, verify=False):
         """
         Match the cropped card image using VLAD.
-        Returns a list of (card_id, similarity) tuples.
+        With verify=True, geometrically re-ranks candidates by RANSAC inliers.
+        Returns a list of (card_id, similarity) or (card_id, similarity, inliers) tuples.
         """
+        if verify:
+            return self.matcher.search_verified(cropped_image, top_k=top_k)
         results = self.matcher.search(cropped_image, top_k=top_k)
         return results
 
-    def identify_card(self, image, k=1):
+    @staticmethod
+    def _match_dicts(matches):
+        """Convert match tuples (with or without inlier counts) to response dicts."""
+        return [
+            {'card_id': m[0], 'similarity': float(m[1])}
+            | ({'inliers': int(m[2])} if len(m) > 2 else {})
+            for m in matches
+        ]
+
+    def identify_card(self, image, k=1, verify=False):
         """
         Identify a single pre-cropped card image.
         Resizes the image to the standard card size used in the pipeline before matching.
@@ -112,19 +124,16 @@ class Scanner:
         # Resize to standard dimensions used in crop()
         card_width = 400
         card_height = int(card_width * (88 / 63))
-        
+
         resized = cv2.resize(image, (card_width, card_height))
-        matches = self.match(resized, top_k=k)
-        
+        matches = self.match(resized, top_k=k, verify=verify)
+
         return {
-            'matches': [
-                {'card_id': m[0], 'similarity': float(m[1])}
-                for m in matches
-            ],
+            'matches': self._match_dicts(matches),
             'box': [0, 0, image.shape[1], image.shape[0]] # Full image box
         }
 
-    def scan(self, image, k=1):
+    def scan(self, image, k=1, verify=False):
         """
         Full scan pipeline: segment, crop (with dewarp), and match.
         Returns a list of dictionaries, each containing the bounding box and a list of matches.
@@ -138,14 +147,11 @@ class Scanner:
                     box = result.boxes[i]
                     mask = result.masks[i] if result.masks is not None else None
                     cropped = self.crop(image, box, mask)
-                    matches = self.match(cropped, top_k=k)
-                    
+                    matches = self.match(cropped, top_k=k, verify=verify)
+
                     if matches:
                         scanned_cards.append({
-                            'matches': [
-                                {'card_id': m[0], 'similarity': float(m[1])}
-                                for m in matches
-                            ],
+                            'matches': self._match_dicts(matches),
                             'box': box.xyxy[0].tolist()
                         })
         

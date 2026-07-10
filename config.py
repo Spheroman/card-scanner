@@ -92,6 +92,15 @@ class Settings(BaseSettings):
     # Concurrency limits
     max_concurrent_downloads: int = 5
 
+    # Geometric verification (RANSAC re-rank) for search_verified()
+    # Reference SIFT features ship in the vectors repository
+    # (features/{category}/{product_id}.npz, written by regen_features.py)
+    # and are LRU-cached in memory once loaded.
+    rerank_candidates: int = 10
+    rerank_lowe_ratio: float = 0.75
+    rerank_ransac_reproj: float = 5.0
+    ref_features_cache_entries: int = 2048
+
     # Retry settings
     retry_attempts: int = 3
     retry_min_wait: float = 1.0

@@ -33,10 +33,11 @@ Uploads an image file, uses YOLO for card detection and segmentation, performs p
 |-----------|--------------|----------|------------------------------------------|
 | `image`   | File (image) | Yes      | The image file to scan                   |
 | `top_n`   | Integer      | No       | Number of top matches per card (default: 3) |
+| `verify`  | Boolean (query) | No   | Geometrically verify matches: re-ranks the top VLAD candidates by SIFT+RANSAC homography inlier count and adds an `inliers` field to each match (default: false) |
 
 **Example:**
 ```bash
-curl -X POST "http://localhost:8000/scan" \
+curl -X POST "http://localhost:8000/scan?verify=true" \
      -F "image=@your_card_photo.jpg" \
      -F "top_n=5"
 ```
@@ -79,6 +80,7 @@ curl -X POST "http://localhost:8000/scan" \
 | `similarity` | Float  | Match confidence score (0-1, higher is better)    |
 | `box`        | Array  | Bounding box coordinates [x1, y1, x2, y2]         |
 | `details`    | Object | Full product details (see Database Schema below)  |
+| `inliers`    | Integer or null | RANSAC homography inlier count (only when `verify=true`; results are sorted by it, and low values — roughly under 50 with the standard 500-keypoint reference features — mean the match is unreliable) |
 
 ---
 
@@ -95,6 +97,7 @@ Resizes the input image to standard card dimensions and performs VLAD matching d
 |-----------|--------------|----------|------------------------------------------|
 | `image`   | File (image) | Yes      | The pre-cropped card image               |
 | `top_n`   | Integer      | No       | Number of top matches to return (default: 3) |
+| `verify`  | Boolean (query) | No   | Geometrically verify matches (see `/scan`) (default: false) |
 
 **Example:**
 ```bash

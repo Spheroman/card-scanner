@@ -9,6 +9,7 @@ import os
 import time
 import git
 import asyncio
+from collections import OrderedDict
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -53,6 +54,12 @@ class VLADCardSearch:
         self._db_ids = None
         self.update_task = None
         self.repo_path = Path(settings.vectors_repo_path)
+        # Bounded LRU cache of reference SIFT features for geometric
+        # verification: card_id -> (points Nx2 float32, RootSIFT descriptors
+        # Nx128 float32), or None for cards without usable features. Backed
+        # by features/{category}/{card_id}.npz in the vectors repository
+        # (written by its regen_features.py, which must stay format-compatible).
+        self._ref_features = OrderedDict()
 
         # Sync repository and set default paths
         self._sync_repository()
@@ -200,6 +207,22 @@ class VLADCardSearch:
         self.centers = data['centers'].astype(np.float32)
         self.k = int(data['k'])
 
+        # Guard against a codebook/encoder mismatch. The query encoder uses SIFT
+        # (128-D descriptors), so the VLAD centers must be 128-D too. A stale
+        # vectors clone — e.g. an old ORB codebook (32-D) left behind when a
+        # sync pull silently failed — would otherwise load here and produce
+        # dimension errors or garbage matches with no obvious cause. Fail loudly.
+        expected_dim = self.sift.descriptorSize()
+        actual_dim = self.centers.shape[1]
+        if actual_dim != expected_dim:
+            raise ValueError(
+                f"Codebook/encoder mismatch: vocabulary centers are {actual_dim}-D "
+                f"but the SIFT encoder produces {expected_dim}-D descriptors. The "
+                f"vectors repository at {self.repo_path} is likely stale (a sync "
+                f"pull may have failed) — delete it to force a fresh clone, or "
+                f"regenerate the codebook. Vocab: {self.vocab_path}"
+            )
+
         # Use the normalize_size the vocabulary was trained with, if present,
         # so encoding matches database generation exactly.
         if 'normalize_size' in data:
@@ -335,8 +358,17 @@ class VLADCardSearch:
         query_vlad = self.encode_vlad(query_image)
 
         # Cosine similarity via dot product (vectors are L2-normalized).
-        # Promote to float32 to avoid float16 precision/overflow issues.
-        similarities = np.dot(self._db_array.astype(np.float32), query_vlad.astype(np.float32))
+        # Computed in float32, chunked: promoting the whole float16 matrix at
+        # once materializes a 2x full-database copy (gigabytes) per query,
+        # which spikes past the deploy VM's memory. Doing the math natively in
+        # float16 is not an option either: numpy has no BLAS path for it
+        # (slower) and its accumulation error (~1e-4) is significant relative
+        # to real match margins (~2e-2).
+        query_f32 = query_vlad.astype(np.float32)
+        similarities = np.empty(self._db_array.shape[0], dtype=np.float32)
+        chunk = 2048
+        for i in range(0, self._db_array.shape[0], chunk):
+            similarities[i:i + chunk] = self._db_array[i:i + chunk].astype(np.float32) @ query_f32
 
         # Select top-k
         top_k = min(top_k, len(similarities))
@@ -349,6 +381,129 @@ class VLADCardSearch:
         results = [(str(self._db_ids[i]), float(similarities[i])) for i in top_indices]
         return results
     
+    @staticmethod
+    def _rootsift(des):
+        """RootSIFT-transform raw SIFT descriptors (L1 normalize + sqrt)."""
+        des = des.astype(np.float32)
+        des /= (np.linalg.norm(des, ord=1, axis=1, keepdims=True) + 1e-7)
+        np.sqrt(des, out=des)
+        return des
+
+    # Canonical size for geometric matching; matches the dewarped crop
+    # produced by scanner.py (400 x 400*88/63).
+    _MATCH_SIZE = (400, 558)
+
+    def _extract_match_features(self, image):
+        """Grayscale, resize to canonical card size, extract RootSIFT features.
+
+        Returns (points Nx2 float32, descriptors Nx128 float32) or None if
+        too few features for a homography.
+        """
+        if len(image.shape) == 3:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        image = cv2.resize(image, self._MATCH_SIZE, interpolation=cv2.INTER_AREA)
+        kp, des = self.sift.detectAndCompute(image, None)
+        if des is None or len(des) < 4:
+            return None
+        pts = np.float32([k.pt for k in kp])
+        return pts, self._rootsift(des)
+
+    def _reference_features(self, card_id):
+        """Get (points, RootSIFT descriptors) for a card's reference image.
+
+        Loaded from features/{category}/{card_id}.npz in the vectors
+        repository (pts uint16, des raw-SIFT uint8; RootSIFT applied here).
+        Features are regenerated together with the VLAD vectors, so any card
+        returned by search() should have them; missing files log a warning
+        and the card keeps its VLAD rank with 0 inliers.
+
+        Returns (points Nx2 float32, descriptors Nx128 float32) or None.
+        LRU-cached in memory (settings.ref_features_cache_entries).
+        """
+        if card_id in self._ref_features:
+            self._ref_features.move_to_end(card_id)
+            return self._ref_features[card_id]
+
+        features = None
+        for npz_path in (self.repo_path / 'features').glob(f'*/{card_id}.npz'):
+            try:
+                data = np.load(npz_path)
+                pts = data['pts'].astype(np.float32)
+                des = data['des'].astype(np.float32)
+                if len(des) >= 4:
+                    features = (pts, self._rootsift(des))
+            except Exception as e:
+                logger.warning(f"Failed to load reference features for {card_id}: {e}")
+            break
+        else:
+            logger.warning(
+                f"No reference features for card {card_id} in "
+                f"{self.repo_path / 'features'} — vectors repo predates "
+                f"regen_features.py or is out of sync"
+            )
+
+        self._ref_features[card_id] = features
+        self._ref_features.move_to_end(card_id)
+        while len(self._ref_features) > settings.ref_features_cache_entries:
+            self._ref_features.popitem(last=False)
+        return features
+
+    def _ransac_inliers(self, query_pts, query_des, ref_pts, ref_des):
+        """Count RANSAC homography inliers between query and reference features."""
+        matches = cv2.BFMatcher(cv2.NORM_L2).knnMatch(query_des, ref_des, k=2)
+        good = [
+            m for m, n in (pair for pair in matches if len(pair) == 2)
+            if m.distance < settings.rerank_lowe_ratio * n.distance
+        ]
+        if len(good) < 4:
+            return len(good)
+        src = query_pts[[m.queryIdx for m in good]].reshape(-1, 1, 2)
+        dst = ref_pts[[m.trainIdx for m in good]].reshape(-1, 1, 2)
+        _, inlier_mask = cv2.findHomography(
+            src, dst, cv2.RANSAC, settings.rerank_ransac_reproj
+        )
+        return int(inlier_mask.sum()) if inlier_mask is not None else 0
+
+    def search_verified(self, query_image, top_k=5, rerank_k=None):
+        """
+        Search with geometric verification: VLAD retrieves candidates, then
+        SIFT + RANSAC homography inlier counts re-rank them.
+
+        Global VLAD vectors can't separate same-art printings and get fragile
+        on degraded photos (margins of ~0.02); the inlier count is a much
+        stronger signal and doubles as a confidence score (tens of inliers or
+        fewer means "not sure").
+
+        Args:
+            query_image: cv2 image (numpy array)
+            top_k: Number of results to return
+            rerank_k: How many VLAD candidates to verify
+                      (default settings.rerank_candidates)
+
+        Returns:
+            List of (card_id, similarity, inliers) tuples sorted by inliers
+            (similarity as tie-break). Falls back to plain VLAD order (all
+            inliers 0) if the query has too few features or the vectors
+            repository has no reference features.
+        """
+        rerank_k = rerank_k or settings.rerank_candidates
+        candidates = self.search(query_image, top_k=max(rerank_k, top_k))
+        if not candidates:
+            return []
+
+        query_features = self._extract_match_features(query_image)
+        results = []
+        for card_id, similarity in candidates:
+            inliers = 0
+            if query_features is not None:
+                ref = self._reference_features(card_id)
+                if ref is not None:
+                    inliers = self._ransac_inliers(*query_features, *ref)
+            results.append((card_id, similarity, inliers))
+
+        results.sort(key=lambda r: (-r[2], -r[1]))
+        return results[:top_k]
+
     def compare_images(self, image1, image2):
         """
         Compare two images directly.
