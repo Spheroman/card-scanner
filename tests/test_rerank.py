@@ -1,8 +1,9 @@
 """
 Tests for geometric verification (search_verified) in vlad_matcher.
 
-Uses synthetic images and monkeypatched reference fetching so no network,
-vocabulary, or vectors repository is needed.
+Uses synthetic images and a temporary features directory (the same npz
+format regen_features.py writes in the vectors repository), so no network,
+vocabulary, or real vectors repository is needed.
 """
 
 import cv2
@@ -28,17 +29,29 @@ def make_card(seed):
 
 
 @pytest.fixture
-def matcher(monkeypatch, tmp_path):
-    """A VLADCardSearch that skips __init__ side effects (no repo sync/load).
-
-    The reference cache is pointed at tmp_path so tests never touch the
-    real ref_images/ directory.
-    """
-    monkeypatch.setattr(vlad_matcher.settings, 'ref_image_cache_path', str(tmp_path))
+def matcher(tmp_path):
+    """A VLADCardSearch that skips __init__ side effects (no repo sync/load),
+    with its vectors repository pointed at tmp_path."""
     m = VLADCardSearch.__new__(VLADCardSearch)
     m.sift = cv2.SIFT_create()
-    m._ref_features = {}
+    m.repo_path = tmp_path
+    m._ref_features = vlad_matcher.OrderedDict()
     return m
+
+
+def write_features(repo_path, card_id, image, category='3'):
+    """Write features for a card the way regen_features.py does (uint16 pts,
+    raw-SIFT uint8 descriptors, canonical 400x558)."""
+    out_dir = repo_path / 'features' / category
+    out_dir.mkdir(parents=True, exist_ok=True)
+    gray = cv2.resize(
+        cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), (400, 558), interpolation=cv2.INTER_AREA
+    )
+    kp, des = cv2.SIFT_create(nfeatures=500).detectAndCompute(gray, None)
+    pts = np.float32([k.pt for k in kp]).round().astype(np.uint16)
+    np.savez_compressed(
+        out_dir / f'{card_id}.npz', pts=pts, des=np.clip(des, 0, 255).astype(np.uint8)
+    )
 
 
 def test_extract_match_features(matcher):
@@ -54,14 +67,14 @@ def test_ransac_prefers_true_card(matcher, monkeypatch):
     lookalike edges it on VLAD similarity."""
     true_img = make_card(42)
     other_img = make_card(43)
+    write_features(matcher.repo_path, '111', true_img)
+    write_features(matcher.repo_path, '222', other_img)
     # Query: the true card, slightly perspective-warped (an imperfect dewarp)
     h, w = true_img.shape[:2]
     src = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
     dst = np.float32([[8, 4], [w - 4, 8], [w - 8, h - 4], [4, h - 8]])
     query = cv2.warpPerspective(true_img, cv2.getPerspectiveTransform(src, dst), (w, h))
 
-    refs = {'111': true_img, '222': other_img}
-    monkeypatch.setattr(matcher, '_fetch_reference_image', lambda card_id: refs[card_id])
     # VLAD says the wrong card is (marginally) better
     monkeypatch.setattr(
         VLADCardSearch, 'search',
@@ -75,8 +88,7 @@ def test_ransac_prefers_true_card(matcher, monkeypatch):
 
 
 def test_search_verified_falls_back_to_vlad_order(matcher, monkeypatch):
-    """If no reference images can be fetched, VLAD ordering is preserved."""
-    monkeypatch.setattr(matcher, '_fetch_reference_image', lambda card_id: None)
+    """With no features in the repo, VLAD ordering is preserved."""
     monkeypatch.setattr(
         VLADCardSearch, 'search',
         lambda self, image, top_k=5: [('1', 0.5), ('2', 0.4), ('3', 0.3)],
@@ -114,21 +126,25 @@ def test_chunked_search_matches_full_promote(matcher, monkeypatch):
     )
 
 
-def test_reference_features_cached_on_disk(matcher, monkeypatch, tmp_path):
-    """Second lookup must hit the npz cache, not re-download."""
-    monkeypatch.setattr(vlad_matcher.settings, 'ref_image_cache_path', str(tmp_path))
-    calls = []
+def test_reference_features_roundtrip_uint8(matcher):
+    """Features written by the generator (uint16/uint8) load into float32
+    RootSIFT descriptors that actually match the same card."""
+    img = make_card(5)
+    write_features(matcher.repo_path, '999', img)
+    ref = matcher._reference_features('999')
+    assert ref is not None
+    pts, des = ref
+    assert pts.dtype == des.dtype == np.float32
+    assert des.shape[1] == 128 and len(pts) == len(des)
+    query = matcher._extract_match_features(img)
+    assert matcher._ransac_inliers(*query, *ref) > 50  # same card matches itself
 
-    def fake_fetch(card_id):
-        calls.append(card_id)
-        return make_card(5)
 
-    monkeypatch.setattr(matcher, '_fetch_reference_image', fake_fetch)
-    pts1, des1 = matcher._reference_features('999')
-    matcher._ref_features.clear()  # drop memory cache, keep disk cache
-    pts2, des2 = matcher._reference_features('999')
-
-    assert calls == ['999']
-    np.testing.assert_allclose(pts1, pts2)
-    # fp16 round-trip on disk
-    np.testing.assert_allclose(des1, des2, atol=1e-3)
+def test_reference_features_missing_and_lru(matcher, monkeypatch):
+    monkeypatch.setattr(vlad_matcher.settings, 'ref_features_cache_entries', 3)
+    assert matcher._reference_features('404') is None  # missing -> None, cached
+    for i in range(5):
+        write_features(matcher.repo_path, str(i), make_card(i + 20))
+        assert matcher._reference_features(str(i)) is not None
+    assert len(matcher._ref_features) == 3  # LRU bounded
+    assert '4' in matcher._ref_features and '404' not in matcher._ref_features

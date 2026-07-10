@@ -9,7 +9,7 @@ import os
 import time
 import git
 import asyncio
-import urllib.request
+from collections import OrderedDict
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -54,10 +54,12 @@ class VLADCardSearch:
         self._db_ids = None
         self.update_task = None
         self.repo_path = Path(settings.vectors_repo_path)
-        # In-memory cache of reference SIFT features for geometric
+        # Bounded LRU cache of reference SIFT features for geometric
         # verification: card_id -> (points Nx2 float32, RootSIFT descriptors
-        # Nx128 float32), or None for cards whose image couldn't be fetched.
-        self._ref_features = {}
+        # Nx128 float32), or None for cards without usable features. Backed
+        # by features/{category}/{card_id}.npz in the vectors repository
+        # (written by its regen_features.py, which must stay format-compatible).
+        self._ref_features = OrderedDict()
 
         # Sync repository and set default paths
         self._sync_repository()
@@ -406,61 +408,44 @@ class VLADCardSearch:
         pts = np.float32([k.pt for k in kp])
         return pts, self._rootsift(des)
 
-    def _fetch_reference_image(self, card_id):
-        """Download a card's reference image (disk-cached). Returns cv2 image or None."""
-        cache_dir = Path(settings.ref_image_cache_path)
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        image_path = cache_dir / f"{card_id}.jpg"
-        if not image_path.exists():
-            for template in settings.ref_image_url_templates:
-                url = template.format(card_id=card_id)
-                try:
-                    req = urllib.request.Request(url, headers={"User-Agent": "card-scanner"})
-                    with urllib.request.urlopen(req, timeout=settings.http_timeout) as resp:
-                        data = resp.read()
-                    image_path.write_bytes(data)
-                    break
-                except Exception as e:
-                    logger.debug(f"Reference image fetch failed for {card_id} at {url}: {e}")
-            else:
-                logger.warning(f"No reference image available for card {card_id}")
-                return None
-        image = cv2.imread(str(image_path))
-        if image is None:
-            # Corrupt cache entry; remove so a later call can re-fetch.
-            image_path.unlink(missing_ok=True)
-        return image
-
     def _reference_features(self, card_id):
-        """Get (points, descriptors) for a card's reference image, or None.
+        """Get (points, RootSIFT descriptors) for a card's reference image.
 
-        Cached in memory and on disk (npz next to the cached image), so each
-        card pays the download + SIFT cost once.
+        Loaded from features/{category}/{card_id}.npz in the vectors
+        repository (pts uint16, des raw-SIFT uint8; RootSIFT applied here).
+        Features are regenerated together with the VLAD vectors, so any card
+        returned by search() should have them; missing files log a warning
+        and the card keeps its VLAD rank with 0 inliers.
+
+        Returns (points Nx2 float32, descriptors Nx128 float32) or None.
+        LRU-cached in memory (settings.ref_features_cache_entries).
         """
         if card_id in self._ref_features:
+            self._ref_features.move_to_end(card_id)
             return self._ref_features[card_id]
 
         features = None
-        npz_path = Path(settings.ref_image_cache_path) / f"{card_id}_sift.npz"
-        if npz_path.exists():
+        for npz_path in (self.repo_path / 'features').glob(f'*/{card_id}.npz'):
             try:
                 data = np.load(npz_path)
-                features = (data['pts'].astype(np.float32), data['des'].astype(np.float32))
+                pts = data['pts'].astype(np.float32)
+                des = data['des'].astype(np.float32)
+                if len(des) >= 4:
+                    features = (pts, self._rootsift(des))
             except Exception as e:
-                logger.warning(f"Failed to load cached features for {card_id}: {e}")
-                npz_path.unlink(missing_ok=True)
-
-        if features is None:
-            image = self._fetch_reference_image(card_id)
-            if image is not None:
-                features = self._extract_match_features(image)
-                if features is not None:
-                    # float16 halves disk usage; promoted back on load.
-                    npz_path.parent.mkdir(parents=True, exist_ok=True)
-                    np.savez(npz_path, pts=features[0], des=features[1].astype(np.float16))
-                    features = (features[0], features[1])
+                logger.warning(f"Failed to load reference features for {card_id}: {e}")
+            break
+        else:
+            logger.warning(
+                f"No reference features for card {card_id} in "
+                f"{self.repo_path / 'features'} — vectors repo predates "
+                f"regen_features.py or is out of sync"
+            )
 
         self._ref_features[card_id] = features
+        self._ref_features.move_to_end(card_id)
+        while len(self._ref_features) > settings.ref_features_cache_entries:
+            self._ref_features.popitem(last=False)
         return features
 
     def _ransac_inliers(self, query_pts, query_des, ref_pts, ref_des):
@@ -498,8 +483,8 @@ class VLADCardSearch:
         Returns:
             List of (card_id, similarity, inliers) tuples sorted by inliers
             (similarity as tie-break). Falls back to plain VLAD order (all
-            inliers 0) if the query has too few features or no reference
-            images could be fetched.
+            inliers 0) if the query has too few features or the vectors
+            repository has no reference features.
         """
         rerank_k = rerank_k or settings.rerank_candidates
         candidates = self.search(query_image, top_k=max(rerank_k, top_k))

@@ -80,7 +80,7 @@ curl -X POST "http://localhost:8000/scan?verify=true" \
 | `similarity` | Float  | Match confidence score (0-1, higher is better)    |
 | `box`        | Array  | Bounding box coordinates [x1, y1, x2, y2]         |
 | `details`    | Object | Full product details (see Database Schema below)  |
-| `inliers`    | Integer or null | RANSAC homography inlier count (only when `verify=true`; results are sorted by it, and low values — roughly under 30 — mean the match is unreliable) |
+| `inliers`    | Integer or null | RANSAC homography inlier count (only when `verify=true`; results are sorted by it, and low values — roughly under 50 with the standard 500-keypoint reference features — mean the match is unreliable) |
 
 ---
 
