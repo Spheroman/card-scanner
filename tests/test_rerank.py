@@ -28,8 +28,13 @@ def make_card(seed):
 
 
 @pytest.fixture
-def matcher():
-    """A VLADCardSearch that skips __init__ side effects (no repo sync/load)."""
+def matcher(monkeypatch, tmp_path):
+    """A VLADCardSearch that skips __init__ side effects (no repo sync/load).
+
+    The reference cache is pointed at tmp_path so tests never touch the
+    real ref_images/ directory.
+    """
+    monkeypatch.setattr(vlad_matcher.settings, 'ref_image_cache_path', str(tmp_path))
     m = VLADCardSearch.__new__(VLADCardSearch)
     m.sift = cv2.SIFT_create()
     m._ref_features = {}
