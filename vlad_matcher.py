@@ -356,8 +356,17 @@ class VLADCardSearch:
         query_vlad = self.encode_vlad(query_image)
 
         # Cosine similarity via dot product (vectors are L2-normalized).
-        # Promote to float32 to avoid float16 precision/overflow issues.
-        similarities = np.dot(self._db_array.astype(np.float32), query_vlad.astype(np.float32))
+        # Computed in float32, chunked: promoting the whole float16 matrix at
+        # once materializes a 2x full-database copy (gigabytes) per query,
+        # which spikes past the deploy VM's memory. Doing the math natively in
+        # float16 is not an option either: numpy has no BLAS path for it
+        # (slower) and its accumulation error (~1e-4) is significant relative
+        # to real match margins (~2e-2).
+        query_f32 = query_vlad.astype(np.float32)
+        similarities = np.empty(self._db_array.shape[0], dtype=np.float32)
+        chunk = 2048
+        for i in range(0, self._db_array.shape[0], chunk):
+            similarities[i:i + chunk] = self._db_array[i:i + chunk].astype(np.float32) @ query_f32
 
         # Select top-k
         top_k = min(top_k, len(similarities))

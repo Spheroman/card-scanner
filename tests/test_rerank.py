@@ -86,6 +86,29 @@ def test_search_verified_empty_search(matcher, monkeypatch):
     assert matcher.search_verified(make_card(9)) == []
 
 
+def test_chunked_search_matches_full_promote(matcher, monkeypatch):
+    """The chunked float32 dot in search() must equal the single full-matrix
+    promote it replaced, across chunk boundaries."""
+    rng = np.random.default_rng(0)
+    n, dim = 5000, 64  # n deliberately not a multiple of the chunk size
+    db = rng.normal(size=(n, dim)).astype(np.float32)
+    db /= np.linalg.norm(db, axis=1, keepdims=True)
+    matcher.database = {str(i): db[i].astype(np.float16) for i in range(n)}
+    matcher._rebuild_search_cache()
+
+    query_vlad = db[7].astype(np.float16)
+    monkeypatch.setattr(matcher, 'encode_vlad', lambda image, max_features=None: query_vlad)
+
+    results = matcher.search(np.zeros((10, 10, 3), dtype=np.uint8), top_k=50)
+
+    expected = np.dot(matcher._db_array.astype(np.float32), query_vlad.astype(np.float32))
+    order = np.argsort(expected)[-50:][::-1]
+    assert [r[0] for r in results] == [str(matcher._db_ids[i]) for i in order]
+    np.testing.assert_array_equal(
+        np.array([r[1] for r in results], dtype=np.float32), expected[order]
+    )
+
+
 def test_reference_features_cached_on_disk(matcher, monkeypatch, tmp_path):
     """Second lookup must hit the npz cache, not re-download."""
     monkeypatch.setattr(vlad_matcher.settings, 'ref_image_cache_path', str(tmp_path))
