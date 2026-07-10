@@ -200,6 +200,22 @@ class VLADCardSearch:
         self.centers = data['centers'].astype(np.float32)
         self.k = int(data['k'])
 
+        # Guard against a codebook/encoder mismatch. The query encoder uses SIFT
+        # (128-D descriptors), so the VLAD centers must be 128-D too. A stale
+        # vectors clone — e.g. an old ORB codebook (32-D) left behind when a
+        # sync pull silently failed — would otherwise load here and produce
+        # dimension errors or garbage matches with no obvious cause. Fail loudly.
+        expected_dim = self.sift.descriptorSize()
+        actual_dim = self.centers.shape[1]
+        if actual_dim != expected_dim:
+            raise ValueError(
+                f"Codebook/encoder mismatch: vocabulary centers are {actual_dim}-D "
+                f"but the SIFT encoder produces {expected_dim}-D descriptors. The "
+                f"vectors repository at {self.repo_path} is likely stale (a sync "
+                f"pull may have failed) — delete it to force a fresh clone, or "
+                f"regenerate the codebook. Vocab: {self.vocab_path}"
+            )
+
         # Use the normalize_size the vocabulary was trained with, if present,
         # so encoding matches database generation exactly.
         if 'normalize_size' in data:
