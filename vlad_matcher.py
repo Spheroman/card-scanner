@@ -9,6 +9,7 @@ import os
 import time
 import git
 import asyncio
+import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -53,6 +54,10 @@ class VLADCardSearch:
         self._db_ids = None
         self.update_task = None
         self.repo_path = Path(settings.vectors_repo_path)
+        # In-memory cache of reference SIFT features for geometric
+        # verification: card_id -> (points Nx2 float32, RootSIFT descriptors
+        # Nx128 float32), or None for cards whose image couldn't be fetched.
+        self._ref_features = {}
 
         # Sync repository and set default paths
         self._sync_repository()
@@ -365,6 +370,146 @@ class VLADCardSearch:
         results = [(str(self._db_ids[i]), float(similarities[i])) for i in top_indices]
         return results
     
+    @staticmethod
+    def _rootsift(des):
+        """RootSIFT-transform raw SIFT descriptors (L1 normalize + sqrt)."""
+        des = des.astype(np.float32)
+        des /= (np.linalg.norm(des, ord=1, axis=1, keepdims=True) + 1e-7)
+        np.sqrt(des, out=des)
+        return des
+
+    # Canonical size for geometric matching; matches the dewarped crop
+    # produced by scanner.py (400 x 400*88/63).
+    _MATCH_SIZE = (400, 558)
+
+    def _extract_match_features(self, image):
+        """Grayscale, resize to canonical card size, extract RootSIFT features.
+
+        Returns (points Nx2 float32, descriptors Nx128 float32) or None if
+        too few features for a homography.
+        """
+        if len(image.shape) == 3:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        image = cv2.resize(image, self._MATCH_SIZE, interpolation=cv2.INTER_AREA)
+        kp, des = self.sift.detectAndCompute(image, None)
+        if des is None or len(des) < 4:
+            return None
+        pts = np.float32([k.pt for k in kp])
+        return pts, self._rootsift(des)
+
+    def _fetch_reference_image(self, card_id):
+        """Download a card's reference image (disk-cached). Returns cv2 image or None."""
+        cache_dir = Path(settings.ref_image_cache_path)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        image_path = cache_dir / f"{card_id}.jpg"
+        if not image_path.exists():
+            for template in settings.ref_image_url_templates:
+                url = template.format(card_id=card_id)
+                try:
+                    req = urllib.request.Request(url, headers={"User-Agent": "card-scanner"})
+                    with urllib.request.urlopen(req, timeout=settings.http_timeout) as resp:
+                        data = resp.read()
+                    image_path.write_bytes(data)
+                    break
+                except Exception as e:
+                    logger.debug(f"Reference image fetch failed for {card_id} at {url}: {e}")
+            else:
+                logger.warning(f"No reference image available for card {card_id}")
+                return None
+        image = cv2.imread(str(image_path))
+        if image is None:
+            # Corrupt cache entry; remove so a later call can re-fetch.
+            image_path.unlink(missing_ok=True)
+        return image
+
+    def _reference_features(self, card_id):
+        """Get (points, descriptors) for a card's reference image, or None.
+
+        Cached in memory and on disk (npz next to the cached image), so each
+        card pays the download + SIFT cost once.
+        """
+        if card_id in self._ref_features:
+            return self._ref_features[card_id]
+
+        features = None
+        npz_path = Path(settings.ref_image_cache_path) / f"{card_id}_sift.npz"
+        if npz_path.exists():
+            try:
+                data = np.load(npz_path)
+                features = (data['pts'].astype(np.float32), data['des'].astype(np.float32))
+            except Exception as e:
+                logger.warning(f"Failed to load cached features for {card_id}: {e}")
+                npz_path.unlink(missing_ok=True)
+
+        if features is None:
+            image = self._fetch_reference_image(card_id)
+            if image is not None:
+                features = self._extract_match_features(image)
+                if features is not None:
+                    # float16 halves disk usage; promoted back on load.
+                    npz_path.parent.mkdir(parents=True, exist_ok=True)
+                    np.savez(npz_path, pts=features[0], des=features[1].astype(np.float16))
+                    features = (features[0], features[1])
+
+        self._ref_features[card_id] = features
+        return features
+
+    def _ransac_inliers(self, query_pts, query_des, ref_pts, ref_des):
+        """Count RANSAC homography inliers between query and reference features."""
+        matches = cv2.BFMatcher(cv2.NORM_L2).knnMatch(query_des, ref_des, k=2)
+        good = [
+            m for m, n in (pair for pair in matches if len(pair) == 2)
+            if m.distance < settings.rerank_lowe_ratio * n.distance
+        ]
+        if len(good) < 4:
+            return len(good)
+        src = query_pts[[m.queryIdx for m in good]].reshape(-1, 1, 2)
+        dst = ref_pts[[m.trainIdx for m in good]].reshape(-1, 1, 2)
+        _, inlier_mask = cv2.findHomography(
+            src, dst, cv2.RANSAC, settings.rerank_ransac_reproj
+        )
+        return int(inlier_mask.sum()) if inlier_mask is not None else 0
+
+    def search_verified(self, query_image, top_k=5, rerank_k=None):
+        """
+        Search with geometric verification: VLAD retrieves candidates, then
+        SIFT + RANSAC homography inlier counts re-rank them.
+
+        Global VLAD vectors can't separate same-art printings and get fragile
+        on degraded photos (margins of ~0.02); the inlier count is a much
+        stronger signal and doubles as a confidence score (tens of inliers or
+        fewer means "not sure").
+
+        Args:
+            query_image: cv2 image (numpy array)
+            top_k: Number of results to return
+            rerank_k: How many VLAD candidates to verify
+                      (default settings.rerank_candidates)
+
+        Returns:
+            List of (card_id, similarity, inliers) tuples sorted by inliers
+            (similarity as tie-break). Falls back to plain VLAD order (all
+            inliers 0) if the query has too few features or no reference
+            images could be fetched.
+        """
+        rerank_k = rerank_k or settings.rerank_candidates
+        candidates = self.search(query_image, top_k=max(rerank_k, top_k))
+        if not candidates:
+            return []
+
+        query_features = self._extract_match_features(query_image)
+        results = []
+        for card_id, similarity in candidates:
+            inliers = 0
+            if query_features is not None:
+                ref = self._reference_features(card_id)
+                if ref is not None:
+                    inliers = self._ransac_inliers(*query_features, *ref)
+            results.append((card_id, similarity, inliers))
+
+        results.sort(key=lambda r: (-r[2], -r[1]))
+        return results[:top_k]
+
     def compare_images(self, image1, image2):
         """
         Compare two images directly.

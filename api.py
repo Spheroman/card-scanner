@@ -366,6 +366,9 @@ class ScanResult(BaseModel):
     similarity: float
     box: List[float]
     details: Optional[dict] = None
+    # RANSAC inlier count when geometric verification was requested
+    # (verify=true); doubles as a match-confidence signal.
+    inliers: Optional[int] = None
 
 
 class ErrorResponse(BaseModel):
@@ -455,6 +458,7 @@ async def scan(
     request: Request,
     image: UploadFile = fastapi.File(...),
     top_n: int = 3,
+    verify: bool = False,
     _api_key: Optional[str] = Depends(verify_api_key),
 ):
     """
@@ -462,6 +466,7 @@ async def scan(
     Args:
         image: The image file to scan
         top_n: The number of top matches to return per card
+        verify: Geometrically verify matches (RANSAC re-rank; adds inlier counts)
     Returns:
         JSON object containing all data for all cards detected
     """
@@ -484,7 +489,7 @@ async def scan(
 
         try:
             detected_cards = await asyncio.wait_for(
-                asyncio.to_thread(scanner.scan, img, k=top_n),
+                asyncio.to_thread(scanner.scan, img, k=top_n, verify=verify),
                 timeout=settings.yolo_timeout,
             )
         except asyncio.TimeoutError:
@@ -515,6 +520,7 @@ async def scan(
                         similarity=similarity,
                         box=box,
                         details=details,
+                        inliers=match.get("inliers"),
                     )
                 )
 
@@ -543,6 +549,7 @@ async def identify(
     request: Request,
     image: UploadFile = fastapi.File(...),
     top_n: int = 4,
+    verify: bool = False,
     _api_key: Optional[str] = Depends(verify_api_key),
 ):
     """
@@ -550,6 +557,7 @@ async def identify(
     Args:
         image: The image file of the card
         top_n: The number of top matches to return
+        verify: Geometrically verify matches (RANSAC re-rank; adds inlier counts)
     Returns:
         JSON object containing data for the identified card matches
     """
@@ -572,7 +580,7 @@ async def identify(
         # Use identify_card (lighter than full scan) with timeout
         try:
             card_result = await asyncio.wait_for(
-                asyncio.to_thread(scanner.identify_card, img, k=top_n),
+                asyncio.to_thread(scanner.identify_card, img, k=top_n, verify=verify),
                 timeout=settings.yolo_timeout,
             )
         except asyncio.TimeoutError:
@@ -603,6 +611,7 @@ async def identify(
                     similarity=similarity,
                     box=box,
                     details=details,
+                    inliers=match.get("inliers"),
                 )
             )
 

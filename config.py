@@ -92,6 +92,23 @@ class Settings(BaseSettings):
     # Concurrency limits
     max_concurrent_downloads: int = 5
 
+    # Geometric verification (RANSAC re-rank) for search_verified()
+    # Candidate reference images are fetched from these URL templates
+    # ({card_id} is substituted), tried in order, and cached on disk along
+    # with their SIFT features.
+    rerank_candidates: int = 10
+    rerank_lowe_ratio: float = 0.75
+    rerank_ransac_reproj: float = 5.0
+    ref_image_cache_path: str = "ref_images"
+    ref_image_url_templates_str: str = Field(
+        default=(
+            "https://tcgplayer-cdn.tcgplayer.com/product/{card_id}_in_1000x1000.jpg,"
+            "https://tcgplayer-cdn.tcgplayer.com/product/{card_id}_400w.jpg,"
+            "https://tcgplayer-cdn.tcgplayer.com/product/{card_id}_200w.jpg"
+        ),
+        validation_alias="CARD_SCANNER_REF_IMAGE_URL_TEMPLATES",
+    )
+
     # Retry settings
     retry_attempts: int = 3
     retry_min_wait: float = 1.0
@@ -122,6 +139,11 @@ class Settings(BaseSettings):
     def default_categories(self) -> List[int]:
         """Get default categories as a list of integers."""
         return parse_int_list(self.default_categories_str, [3])
+
+    @property
+    def ref_image_url_templates(self) -> List[str]:
+        """Get reference image URL templates as a list."""
+        return parse_comma_list(self.ref_image_url_templates_str)
 
     @property
     def db_update_time(self) -> dt_time:
